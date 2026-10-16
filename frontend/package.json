@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:storyboard-cancellation": "jiti tests/storyboardRequest.test.ts",
     "lint": "oxlint",
     "preview": "vite preview"
   },

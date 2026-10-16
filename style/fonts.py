@@ -3,11 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Dict
-from functools import lru_cache
-
-import numpy as np
 from PIL import ImageFont
-from sentence_transformers import SentenceTransformer
 
 FONT_ROOT = Path("assets/fonts")
 
@@ -18,29 +14,6 @@ FONT_REGISTRY: Dict[str, Path] = {
     "karantula": FONT_ROOT / "DigitalStripBB" / "PatrickHand-Regular.woff2",
     "manoskope": FONT_ROOT / "DigitalStripBB" / "PatrickHand-Regular.woff2",
 }
-
-# Semantic description for each font
-FONT_DESCRIPTIONS: Dict[str, str] = {
-    "actionman": "neutral calm normal default casual friendly conversation",
-    "digitalstrip": "surprised shocked amazed astonished wow unexpected stunning",
-    "komika": "angry furious shouting rage mad frustrated yelling intense",
-    "karantula": "scary horror creepy spooky frightening terrifying dark evil",
-    "manoskope": "sad melancholy sorry apologetic depressed gloomy regretful",
-}
-
-
-@lru_cache(maxsize=1)
-def _get_model() -> SentenceTransformer:
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-
-@lru_cache(maxsize=1)
-def _get_font_embeddings() -> tuple[list[str], np.ndarray]:
-    model = _get_model()
-    fonts = list(FONT_DESCRIPTIONS.keys())
-    embeddings = model.encode(list(FONT_DESCRIPTIONS.values()))
-    return fonts, embeddings
-
 
 def get_font_name_for_emotion(emotion: str | None) -> str:
     if not emotion:

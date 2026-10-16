@@ -1,65 +1,61 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
+from pathlib import Path
+
+import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from pathlib import Path
-from panel_engine.unified_pipeline import generate_panels_unified
-from page.builder import build_comic_page
-from page.layouts import select_layout_name
-from utils.parser import load_comic_from_json
 
-from studio_graph.graph import create_studio_graph
-from config import CONFIG, resolve_lora_selection
-import uvicorn
+from comfyui.client import ComfyUIClient, ComfyUIError
+from comfyui.profiles import ProfileError, RendererProfileStore
+from config import CONFIG
+from panel_engine.comfy_renderer import render_comic_schema
+from studio_graph.graph import create_storyboard_graph
+from utils.parser import load_comic_from_json
 
 load_dotenv()
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Ekphra FLUX.2 Comic Studio")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Output dirs
 output_dir = Path("outputs")
 output_dir.mkdir(parents=True, exist_ok=True)
-panels_dir = output_dir / "panels"
-panels_dir.mkdir(parents=True, exist_ok=True)
-
-CONFIG.paths.panel_dir = str(panels_dir)
+(output_dir / "panels").mkdir(parents=True, exist_ok=True)
+CONFIG.paths.panel_dir = str(output_dir / "panels")
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+storyboard_graph = create_storyboard_graph()
 
-class GenerateRequest(BaseModel):
+
+class StoryboardRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10000)
-    layoutStyle: str = "auto"
-    mangaLayout: str = "style1"
-    steps: int = Field(default=80, ge=10, le=180)
-    guidance: float = 7.5
-    lora: str = "ghibli"
-    negativePrompt: str = ""
-    seed: str = ""
     pageCount: int = Field(default=1, ge=1, le=8)
 
-class RegeneratePanelRequest(BaseModel):
+
+class RenderRequest(BaseModel):
+    storyboard: dict | None = None
+    rendererProfile: str
+    layoutStyle: str = "auto"
+    mangaLayout: str = "style1"
+    steps: int | None = Field(default=None, ge=1, le=500)
+    guidance: float | None = Field(default=None, ge=0, le=100)
+    negativePrompt: str = ""
+    seed: int | None = Field(default=None, ge=0)
+    jobId: str | None = Field(default=None, max_length=100)
+
+
+class RegeneratePanelRequest(RenderRequest):
     pageUrl: str = Field(min_length=1)
     panelId: str = Field(min_length=1, max_length=100)
-    panelPrompt: str = Field(min_length=1, max_length=2000)
+    panelPrompt: str = Field(min_length=1, max_length=4000)
     dialogues: list[dict] = Field(default_factory=list)
-    steps: int = Field(default=20, ge=1, le=180)
-    guidance: float = Field(default=7.5, ge=1, le=30)
-    lora: str = "ghibli"
-    negativePrompt: str = ""
-    seed: str = ""
     mode: str = Field(default="panel", pattern="^(panel|dialogue)$")
 
 
@@ -67,273 +63,179 @@ class SavePageRequest(BaseModel):
     pageUrl: str = Field(min_length=1)
     filename: str = Field(default="comic-page.png", min_length=1, max_length=120)
 
-graph = create_studio_graph()
 
-LORA_DIR = Path("models/loras")
-
-def available_loras() -> list[dict[str, str]]:
-    allowed = {".safetensors", ".pt", ".ckpt"}
-    if not LORA_DIR.exists():
-        return []
-    return [{"id": p.name, "label": p.stem.replace("_", " ").replace("-", " ")} for p in sorted(LORA_DIR.iterdir(), key=lambda p: p.name.lower()) if p.is_file() and p.suffix.lower() in allowed]
+def profile_store() -> RendererProfileStore:
+    return RendererProfileStore(os.getenv("RENDERER_PROFILES_FILE", CONFIG.comfyui.profiles_file))
 
 
-def resolve_lora_path(selection: str) -> str | None:
-    """Resolve both built-in aliases and filenames discovered from models/loras."""
-    return resolve_lora_selection(selection, str(LORA_DIR))
+def comfy_client() -> ComfyUIClient:
+    return ComfyUIClient(
+        os.getenv("COMFYUI_BASE_URL", CONFIG.comfyui.base_url),
+        timeout_seconds=int(os.getenv("COMFYUI_TIMEOUT_SECONDS", CONFIG.comfyui.timeout_seconds)),
+        poll_seconds=float(os.getenv("COMFYUI_POLL_SECONDS", CONFIG.comfyui.poll_seconds)),
+    )
 
 
-@app.get("/api/capabilities")
-async def get_capabilities():
-    """Expose safe provider status; never return API keys."""
-    return {
-        "sd15": True,
-        "loras": available_loras(),
-    }
-
-@app.get("/api/history")
-async def get_history():
-    files = []
-    for f in output_dir.glob("comic_page_*.png"):
-        # Keep rendered pages visible even when Vision QA rejected them. A
-        # rejected page is still useful for inspection, and hiding it made a
-        # successful diffusion run look as if nothing had been generated.
-        # The frontend replaces intermediate retry results while a request is
-        # active, so the user can still inspect the latest page without an
-        # empty history after a browser refresh.
-        files.append((f.stat().st_mtime, f.name))
-    files.sort(reverse=True)
-    return {"history": [f"/outputs/{name}" for _, name in files]}
+def profile_or_422(profile_id: str):
+    try:
+        return profile_store().get(profile_id)
+    except ProfileError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/api/save-page")
-async def save_page(req: SavePageRequest):
-    """Persist a generated page in outputs/saved for later use/download."""
-    relative = req.pageUrl.removeprefix("/outputs/").replace("/", os.sep)
-    source = (output_dir / relative).resolve()
-    if output_dir.resolve() not in source.parents or not source.exists():
-        raise HTTPException(status_code=404, detail="Page not found")
-    safe_name = Path(req.filename).name
-    if Path(safe_name).suffix.lower() != ".png":
-        safe_name += ".png"
-    saved_dir = (output_dir / "saved").resolve()
-    saved_dir.mkdir(parents=True, exist_ok=True)
-    destination = saved_dir / safe_name
-    source.replace(destination) if source == destination else destination.write_bytes(source.read_bytes())
-    return {"url": "/outputs/saved/" + destination.name}
+def rendering_settings(req: RenderRequest) -> dict:
+    return {"steps": req.steps, "guidance": req.guidance, "negative_prompt": req.negativePrompt, "seed": req.seed}
 
 
-@app.get("/api/page-meta")
-async def get_page_meta(url: str = Query(..., min_length=1)):
-    """Return panel geometry and editable content for any generated page.
-
-    History entries predate the current SSE metadata event, so the UI can use
-    this endpoint to show the same regenerate controls when an old page is
-    selected from the sidebar.
-    """
-    relative = url.removeprefix("/outputs/").replace("/", os.sep)
+def page_job_info(page_url: str) -> tuple[Path, str, int]:
+    relative = page_url.removeprefix("/outputs/").replace("/", os.sep)
     page_path = (output_dir / relative).resolve()
     if output_dir.resolve() not in page_path.parents or not page_path.exists():
         raise HTTPException(status_code=404, detail="Page not found")
     parts = page_path.stem.split("_")
     if len(parts) < 4 or parts[:2] != ["comic", "page"]:
         raise HTTPException(status_code=400, detail="Unsupported page URL")
-    job_id = "_".join(parts[2:-1])
-    page_number = int(parts[-1])
-    job_dir = output_dir / "jobs" / job_id
-    schema_file = job_dir / "story.json"
-    layout_file = job_dir / "page_layout.json"
-    if not schema_file.exists() or not layout_file.exists():
-        raise HTTPException(status_code=404, detail="Page metadata not found")
-    schema = json.loads(schema_file.read_text(encoding="utf-8"))
-    layout = json.loads(layout_file.read_text(encoding="utf-8"))
-    panels = next(
-        (page.get("panels", []) for page in schema.get("pages", [])
-         if int(page.get("page_number", 1)) == page_number),
-        [],
-    )
-    return {
-        "url": "/outputs/" + page_path.relative_to(output_dir.resolve()).as_posix(),
-        "pageWidth": layout.get("page_width", CONFIG.page.width),
-        "pageHeight": layout.get("page_height", CONFIG.page.height),
-        "panels": [
-            {
-                "x": pos[0], "y": pos[1], "width": pos[2], "height": pos[3],
-                "id": panel.get("id"),
-                "prompt": panel.get("panel_prompt_en", ""),
-                "dialogues": panel.get("dialogues", []),
-            }
-            for pos, panel in zip(layout.get("panels", []), panels)
-            if len(pos) == 4
-        ],
+    return page_path, "_".join(parts[2:-1]), int(parts[-1])
+
+
+@app.get("/api/capabilities")
+async def get_capabilities():
+    try:
+        profiles = profile_store().load()
+        return {
+            "renderer": "comfyui",
+            "profiles": [{"id": item.id, "label": item.label, "description": item.description} for item in profiles.values()],
+            "visionQaEnabled": CONFIG.vision.enabled,
+        }
+    except ProfileError as exc:
+        return {"renderer": "comfyui", "profiles": [], "profileError": str(exc), "visionQaEnabled": CONFIG.vision.enabled}
+
+
+async def invoke_storyboard_graph(state: dict, request: Request) -> dict:
+    """Release a disconnected HTTP request without claiming to stop LM Studio.
+
+    LangGraph and ChatOpenAI run synchronously. The worker thread lets the
+    async endpoint observe a browser disconnect, but an already-issued local
+    LLM HTTP request cannot be cancelled reliably from that thread.
+    """
+    task = asyncio.create_task(asyncio.to_thread(
+        storyboard_graph.invoke,
+        state,
+        {"configurable": {"thread_id": f"storyboard_{uuid.uuid4().hex}"}},
+    ))
+    while not task.done():
+        if await request.is_disconnected():
+            logger.info("Storyboard request cancelled by client; LM Studio inference may continue.")
+            # Retrieve a later exception, if any, without awaiting the work.
+            task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+            raise HTTPException(status_code=499, detail="Storyboard request cancelled by client.")
+        await asyncio.sleep(0.1)
+    return task.result()
+
+
+@app.post("/api/storyboards")
+async def create_storyboard(req: StoryboardRequest, request: Request):
+    state = {
+        "generation_id": uuid.uuid4().hex, "user_prompt": req.prompt, "requested_language": "",
+        "current_schema": {}, "story_plan": {}, "dialogue_plan": {}, "normalization_notes": [], "vision_qa": {},
+        "vision_retry_count": 0, "max_vision_retries": 0, "validation_errors": [],
+        "next_step": "", "pageCount": req.pageCount, "retry_count": 0,
+        "max_retries": CONFIG.story.max_retries, "generation_error": "",
     }
+    try:
+        final_state = await invoke_storyboard_graph(state, request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Storyboard LLM request failed before structural validation.")
+        raise HTTPException(status_code=502, detail=f"Storyboard LLM request failed: {exc}") from exc
+    if final_state.get("generation_error"):
+        logger.error("Storyboard request rejected: %s", final_state["generation_error"])
+        raise HTTPException(status_code=422, detail=final_state["generation_error"])
+    schema = final_state.get("current_schema")
+    if not isinstance(schema, dict) or not schema.get("pages"):
+        logger.error("Storyboard request ended without an approved schema: %s", final_state.get("validation_errors", []))
+        raise HTTPException(status_code=422, detail=f"Storyboard was not approved: {final_state.get('validation_errors', [])}")
+    return {"storyboard": schema, "storyPlan": final_state.get("story_plan", {}), "dialoguePlan": final_state.get("dialogue_plan", {})}
+
+
+@app.post("/api/render-storyboard")
+async def render_storyboard(req: RenderRequest):
+    if not isinstance(req.storyboard, dict):
+        raise HTTPException(status_code=422, detail="A storyboard JSON object is required before rendering.")
+    try:
+        load_comic_from_json(req.storyboard)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid storyboard JSON: {exc}") from exc
+    profile = profile_or_422(req.rendererProfile)
+    job_id = req.jobId or uuid.uuid4().hex
+    try:
+        pages, _ = render_comic_schema(req.storyboard, job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout)
+    except (ComfyUIError, ProfileError, ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"jobId": job_id, "pages": ["/outputs/" + Path(path).relative_to(output_dir).as_posix() for path in pages]}
+
+
+@app.get("/api/history")
+async def get_history():
+    files = sorted(((f.stat().st_mtime, f.name) for f in output_dir.glob("comic_page_*.png")), reverse=True)
+    return {"history": [f"/outputs/{name}" for _, name in files]}
+
+
+@app.get("/api/page-meta")
+async def get_page_meta(url: str = Query(..., min_length=1)):
+    page_path, job_id, page_number = page_job_info(url)
+    job_dir = output_dir / "jobs" / job_id
+    try:
+        schema = json.loads((job_dir / "story.json").read_text(encoding="utf-8"))
+        layout = json.loads((job_dir / "page_layout.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=f"Page metadata not found: {exc}") from exc
+    panels = next((page.get("panels", []) for page in schema.get("pages", []) if int(page.get("page_number", 1)) == page_number), [])
+    return {"url": "/outputs/" + page_path.relative_to(output_dir.resolve()).as_posix(), "pageWidth": layout.get("page_width", CONFIG.page.width), "pageHeight": layout.get("page_height", CONFIG.page.height), "panels": [
+        {"x": pos[0], "y": pos[1], "width": pos[2], "height": pos[3], "id": panel.get("id"), "prompt": panel.get("panel_prompt_en", ""), "dialogues": panel.get("dialogues", [])}
+        for pos, panel in zip(layout.get("panels", []), panels) if len(pos) == 4
+    ]}
+
 
 @app.post("/api/regenerate-panel")
 async def regenerate_panel(req: RegeneratePanelRequest):
-    """Regenerate one panel and rebuild its containing page."""
-    relative = req.pageUrl.removeprefix("/outputs/").replace("/", os.sep)
-    page_path = (output_dir / relative).resolve()
-    if output_dir.resolve() not in page_path.parents or not page_path.exists():
-        raise HTTPException(status_code=404, detail="Page not found")
-    # Page names are comic_page_<job uuid>_<page number>.png.
-    parts = page_path.stem.split("_")
-    if len(parts) < 4 or parts[0:2] != ["comic", "page"]:
-        raise HTTPException(status_code=400, detail="Unsupported page URL")
-    job_id = "_".join(parts[2:-1])
-    page_number = int(parts[-1])
-    job_dir = output_dir / "jobs" / job_id
-    schema_path = job_dir / "story.json"
+    page_path, job_id, _ = page_job_info(req.pageUrl)
+    schema_path = output_dir / "jobs" / job_id / "story.json"
     if not schema_path.exists():
         raise HTTPException(status_code=404, detail="Generation job not found")
-
-    with schema_path.open("r", encoding="utf-8") as handle:
-        schema = json.load(handle)
-    comic = load_comic_from_json(schema)
-    panel = next((item for item in comic.panels if item.id == req.panelId), None)
-    if panel is None:
-        raise HTTPException(status_code=404, detail="Panel not found")
-    panel.panel_prompt_en = req.panelPrompt
-    panel.dialogues = req.dialogues
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    found = False
     for page in schema.get("pages", []):
-        for item in page.get("panels", []):
-            if item.get("id") == req.panelId:
-                item["panel_prompt_en"] = req.panelPrompt
-                item["dialogues"] = req.dialogues
-    schema_path.write_text(json.dumps(schema, indent=2, ensure_ascii=False), encoding="utf-8")
+        for panel in page.get("panels", []):
+            if panel.get("id") == req.panelId:
+                panel["panel_prompt_en"] = req.panelPrompt
+                panel["dialogues"] = req.dialogues
+                found = True
+    if not found:
+        raise HTTPException(status_code=404, detail="Panel not found")
+    profile = profile_or_422(req.rendererProfile)
+    try:
+        # An empty target set means compositor-only dialogue editing.
+        targets = [] if req.mode == "dialogue" else [req.panelId]
+        render_comic_schema(schema, job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout, targets)
+    except (ComfyUIError, ProfileError, ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"url": "/outputs/" + page_path.relative_to(output_dir.resolve()).as_posix(), "panelId": req.panelId, "mode": req.mode}
 
-    page_panels = [item for item in comic.panels if item.page_number == page_number]
-    panel_dir = job_dir / "panels"
-    seed = int(req.seed) if req.seed.isdigit() else None
-    # Dialogue-only edits should preserve the rendered panel and only rebuild
-    # the page compositor. This avoids an unnecessary diffusion run and keeps
-    # bubble changes independent from image prompt changes.
-    if req.mode == "panel":
-        generate_panels_unified(
-            schema_path=str(schema_path), output_panel_dir=str(panel_dir),
-            base_model_path=CONFIG.models.base_model, device=CONFIG.models.device,
-            base="SDv1.5", lora_path=resolve_lora_path(req.lora),
-            lora_scale=CONFIG.models.lora_scale, panel_steps=req.steps,
-            guidance_scale=req.guidance, max_render_width=CONFIG.quality.max_render_width,
-            max_render_height=CONFIG.quality.max_render_height,
-            negative_prompt_extra=req.negativePrompt, target_panel_ids=[req.panelId],
-            series_id=f"regenerate_{job_id}", seed=seed, style_name=CONFIG.style.preset,
-        )
-    expected_ids = [item.id for item in page_panels]
-    layout = select_layout_name(len(expected_ids))
-    build_comic_page(str(panel_dir), str(page_path), expected_ids, str(schema_path),
-                     inject_bubbles=True, use_adaptive_layout=True, layout_name=layout)
-    # page_path is resolved above while output_dir is configured as a relative
-    # path.  Resolve both before relative_to; otherwise regeneration succeeds
-    # but the endpoint raises a 500 while constructing the response URL.
-    return {"url": "/outputs/" + page_path.relative_to(output_dir.resolve()).as_posix(),
-            "panelId": req.panelId, "mode": req.mode}
 
-@app.post("/api/generate")
-async def generate_short_comic(req: GenerateRequest):
-    
-    async def event_generator():
-        yield "data: [START] Starting comic generation...\n\n"
-        await asyncio.sleep(0.1)
-        
-        config = {"configurable": {"thread_id": f"short_comic_{uuid.uuid4().hex}"}}
-        
-        try:
-            # We can stream the events from LangGraph
-            initial_state = {
-                "generation_id": uuid.uuid4().hex,
-                "user_prompt": req.prompt, 
-                "requested_language": "",
-                "current_schema": {}, 
-                "story_plan": {},
-                "dialogue_plan": {},
-                "vision_qa": {},
-                "vision_retry_count": 0,
-                # Keep the production default strict, but allow short Colab
-                # smoke tests to opt into a much smaller retry budget.
-                "max_vision_retries": max(0, int(os.getenv("MAX_VISION_RETRIES", "3"))),
-                "validation_errors": [], 
-                "next_step": "",
-                "layoutStyle": req.layoutStyle,
-                "mangaLayout": req.mangaLayout,
-                "steps": req.steps,
-                "guidance": req.guidance,
-                "lora": req.lora,
-                "negativePrompt": req.negativePrompt,
-                "seed": req.seed,
-                "pageCount": req.pageCount,
-                "retry_count": 0,
-                "max_retries": CONFIG.story.max_retries,
-                "generation_error": "",
-                "image_provider": "sd15",
-            }
-            for event in graph.stream(initial_state, config):
-                for key, value in event.items():
-                    if key == "story_planner":
-                        yield "data: [AGENT] Planning the story beats and punchline...\n\n"
-                    elif key == "dialogue_writer":
-                        yield "data: [AGENT] Writing and checking natural dialogue...\n\n"
-                    elif key == "storyboarder":
-                        yield "data: [AGENT] Building the detailed storyboard...\n\n"
-                    elif key == "validator":
-                        errs = value.get("validation_errors", [])
-                        generation_error = value.get("generation_error", "")
-                        if generation_error:
-                            yield f"data: [ERROR] {generation_error}\n\n"
-                        elif errs:
-                            yield f"data: [AGENT] Art Director requested changes: {errs[0][:100]}...\n\n"
-                        else:
-                            yield "data: [AGENT] Storyboard approved! Starting rendering...\n\n"
-                    elif key == "renderer":
-                        retry_no = int(value.get("vision_retry_count", 0))
-                        message = (
-                            f"[RENDERER] Rendering replacement attempt {retry_no + 1} for the same comic page..."
-                            if retry_no else
-                            "[RENDERER] Rendering and assembling the comic page..."
-                        )
-                        yield f"data: {message}\n\n"
-                        # When renderer is done, it adds 'output_pages' to state
-                        output_pages = value.get("output_pages", [])
-                        if output_pages:
-                            for page_path in output_pages:
-                                # Convert local path to URL
-                                url_path = Path(page_path).relative_to("outputs").as_posix()
-                                yield f"data: [RESULT] /outputs/{url_path}\n\n"
-                                page_file = Path(page_path)
-                                job_dir = output_dir / "jobs" / page_file.stem.split("_")[2]
-                                schema_file = job_dir / "story.json"
-                                if schema_file.exists():
-                                    schema = json.loads(schema_file.read_text(encoding="utf-8"))
-                                    page_no = int(page_file.stem.split("_")[-1])
-                                    panels = next((p.get("panels", []) for p in schema.get("pages", []) if p.get("page_number") == page_no), [])
-                                    layout_file = job_dir / "page_layout.json"
-                                    layout = json.loads(layout_file.read_text(encoding="utf-8")) if layout_file.exists() else {"page_width": CONFIG.page.width, "page_height": CONFIG.page.height, "panels": []}
-                                    meta = {"url": f"/outputs/{url_path}", "pageWidth": layout["page_width"], "pageHeight": layout["page_height"], "panels": []}
-                                    for pos, panel in zip(layout.get("panels", []), panels):
-                                        if len(pos) != 4:
-                                            continue
-                                        x, y, width, height = pos
-                                        meta["panels"].append({"x": x, "y": y, "width": width, "height": height, "id": panel.get("id"), "prompt": panel.get("panel_prompt_en", ""), "dialogues": panel.get("dialogues", [])})
-                                    yield "data: [META] " + json.dumps(meta, ensure_ascii=False) + "\n\n"
-                    elif key == "vision_qa":
-                        qa = value.get("vision_qa", {})
-                        status = "Passed" if qa.get("passed") else "Rejected"
-                        attempt = int(value.get("vision_retry_count", 0)) + 1
-                        max_attempts = int(value.get("max_vision_retries", 0)) + 1
-                        corrections = "; ".join(
-                            str(item.get("correction") or item.get("reason", ""))
-                            for item in qa.get("issues", [])[:3]
-                        )
-                        detail = qa.get("summary", "")
-                        if corrections:
-                            detail += f" Corrections: {corrections}"
-                        suffix = " Continuing with a replacement render for the same page." if not qa.get("passed") and attempt < max_attempts else ""
-                        yield f"data: [VISION QA] Attempt {attempt}/{max_attempts} - {status} ({qa.get('score', 0)}/10): {detail}{suffix}\n\n"
-        except Exception as e:
-            yield f"data: [ERROR] System error: {e}\n\n"
-            
-        yield "data: [DONE]\n\n"
-            
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+@app.post("/api/save-page")
+async def save_page(req: SavePageRequest):
+    page_path, _, _ = page_job_info(req.pageUrl)
+    saved_dir = output_dir / "saved"
+    saved_dir.mkdir(parents=True, exist_ok=True)
+    name = Path(req.filename).name
+    if Path(name).suffix.lower() != ".png":
+        name += ".png"
+    destination = saved_dir / name
+    destination.write_bytes(page_path.read_bytes())
+    return {"url": "/outputs/saved/" + destination.name}
+
 
 if __name__ == "__main__":
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)

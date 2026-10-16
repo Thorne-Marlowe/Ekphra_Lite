@@ -13,8 +13,16 @@ from .prompts import (
     DIALOGUE_WRITER_HUMAN_PROMPT,
     VISION_QA_SYSTEM_PROMPT,
 )
+from .structured_output import (
+    DIALOGUE_PLAN_SCHEMA,
+    STORYBOARD_SCHEMA,
+    STORY_PLAN_SCHEMA,
+    create_structured_llm,
+)
+from .validation import validate_storyboard_structure
 import os
 import base64
+import logging
 import re
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +30,8 @@ from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 base_url = os.getenv("OPENAI_BASE_URL")
 if not base_url:
@@ -31,7 +41,9 @@ chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o")
 vision_model = os.getenv("OPENAI_VISION_MODEL", chat_model)
 
 llm = ChatOpenAI(model=chat_model, temperature=0.7, base_url=base_url)
-llm_json = ChatOpenAI(model=chat_model, temperature=0.7, base_url=base_url, model_kwargs={"response_format": {"type": "json_object"}})
+story_planner_llm = create_structured_llm(chat_model, base_url, "story_plan", STORY_PLAN_SCHEMA)
+dialogue_writer_llm = create_structured_llm(chat_model, base_url, "dialogue_plan", DIALOGUE_PLAN_SCHEMA)
+storyboarder_llm = create_structured_llm(chat_model, base_url, "comic_storyboard", STORYBOARD_SCHEMA)
 
 def parse_json_content(content) -> dict:
     raw = content if isinstance(content, str) else json.dumps(content)
@@ -61,6 +73,103 @@ def _panel_number(value) -> int:
         return int(text)
     match = re.search(r"(?:panel[_ -]*)?(?:\d+[_ -]+)?(\d+)$", text, re.IGNORECASE)
     return int(match.group(1)) if match else 0
+
+
+def _character_identity(value) -> str:
+    """Return a conservative comparison key for IDs and display names."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def normalize_dialogue_plan_character_ids(
+    dialogue_plan: dict,
+    characters: dict,
+    story_plan: dict,
+) -> tuple[list[dict], list[str]]:
+    """Map unambiguous earlier-stage dialogue references to final cast IDs.
+
+    The storyboard's ``characters`` keys are authoritative.  An exact final
+    key is left untouched.  Earlier planner IDs are translated only after the
+    planner's character name has one—and only one—matching final character.
+    Unknown or ambiguous values deliberately remain unchanged so deterministic
+    validation can report them instead of inventing a cast identity.
+    """
+    canonical_ids = {str(character_id) for character_id in characters if str(character_id).strip()}
+    aliases: dict[str, set[str]] = {}
+
+    def add_alias(value, character_id: str) -> None:
+        key = _character_identity(value)
+        if key:
+            aliases.setdefault(key, set()).add(character_id)
+
+    for character_id, character in characters.items():
+        canonical_id = str(character_id)
+        add_alias(canonical_id, canonical_id)
+        if isinstance(character, dict):
+            add_alias(character.get("name"), canonical_id)
+
+    planner_characters = story_plan.get("characters", []) if isinstance(story_plan, dict) else []
+    if isinstance(planner_characters, list):
+        for character in planner_characters:
+            if not isinstance(character, dict):
+                continue
+            planner_id = character.get("id")
+            name_key = _character_identity(character.get("name"))
+            candidates = aliases.get(name_key, set())
+            if planner_id is not None and len(candidates) == 1:
+                add_alias(planner_id, next(iter(candidates)))
+
+    normalized: list[dict] = []
+    notes: list[str] = []
+    dialogues = dialogue_plan.get("dialogues", []) if isinstance(dialogue_plan, dict) else []
+    if not isinstance(dialogues, list):
+        return normalized, notes
+    for dialogue in dialogues:
+        if not isinstance(dialogue, dict):
+            normalized.append(dialogue)
+            continue
+        item = dict(dialogue)
+        field = "character_id" if item.get("character_id") is not None else "character"
+        reference = item.get(field)
+        reference_text = str(reference).strip() if reference is not None else ""
+        resolved = reference_text if reference_text in canonical_ids else None
+        if resolved is None:
+            candidates = aliases.get(_character_identity(reference_text), set())
+            if len(candidates) == 1:
+                resolved = next(iter(candidates))
+        if resolved and resolved != reference_text:
+            item["character_id"] = resolved
+            item.pop("character", None)
+            notes.append(f"Normalized dialogue character ID '{reference_text}' to canonical ID '{resolved}'.")
+        normalized.append(item)
+    return normalized, notes
+
+
+def merge_approved_dialogues(schema: dict, dialogue_plan: dict, story_plan: dict) -> list[str]:
+    """Copy approved dialogue into final panels using canonical character IDs."""
+    approved, normalization_notes = normalize_dialogue_plan_character_ids(
+        dialogue_plan,
+        schema.get("characters", {}),
+        story_plan,
+    )
+    by_panel: dict[int, list[dict]] = {}
+    for item in approved:
+        if not isinstance(item, dict):
+            continue
+        panel_number = _panel_number(item.get("panel", 0))
+        character_id = item.get("character_id") or item.get("character")
+        if panel_number > 0 and character_id and item.get("text"):
+            by_panel.setdefault(panel_number, []).append({
+                "character_id": character_id,
+                "text": item["text"],
+                "emotion": item.get("emotion", "neutral"),
+            })
+    for page in schema.get("pages", []):
+        for index, panel in enumerate(page.get("panels", []), start=1):
+            panel_number = (int(page.get("page_number", 1)) - 1) * 6 + index
+            # The dialogue plan is authoritative, including an explicit empty
+            # list for an intentional silent beat.
+            panel["dialogues"] = by_panel.get(panel_number, [])
+    return normalization_notes
 
 
 def _apply_story_constraints(schema: dict, story_plan: dict) -> None:
@@ -194,7 +303,7 @@ def _enforce_vision_gate(review: dict, expected_panel_ids: set[str] | None = Non
 
 def run_story_planner(state: StudioState) -> StudioState:
     prompt = ChatPromptTemplate.from_messages([("system", STORY_PLANNER_SYSTEM_PROMPT), ("human", STORY_PLANNER_HUMAN_PROMPT)])
-    result = (prompt | llm_json).invoke({"idea": state["user_prompt"], "pages": state.get("pageCount", 1)})
+    result = (prompt | story_planner_llm).invoke({"idea": state["user_prompt"], "pages": state.get("pageCount", 1)})
     try:
         state["story_plan"] = parse_json_content(result.content)
         # Keep the language selected by the planner as an explicit state value;
@@ -360,7 +469,7 @@ def run_vision_qa(state: StudioState) -> StudioState:
 
 def run_dialogue_writer(state: StudioState) -> StudioState:
     prompt = ChatPromptTemplate.from_messages([("system", DIALOGUE_WRITER_SYSTEM_PROMPT), ("human", DIALOGUE_WRITER_HUMAN_PROMPT)])
-    result = (prompt | llm_json).invoke({
+    result = (prompt | dialogue_writer_llm).invoke({
         "plan": json.dumps(state.get("story_plan", {}), ensure_ascii=False),
         "language": state.get("requested_language") or state.get("story_plan", {}).get("language", "English"),
         "corrections": json.dumps(state.get("story_plan", {}).get("vision_corrections", []), ensure_ascii=False),
@@ -389,7 +498,7 @@ def run_storyboarder(state: StudioState) -> StudioState:
         ("human", human_msg)
     ])
     
-    chain = prompt | llm_json
+    chain = prompt | storyboarder_llm
     res = chain.invoke({
         "prompt": state["user_prompt"],
         "draft": json.dumps(state.get("current_schema", {}), ensure_ascii=False),
@@ -449,25 +558,14 @@ def run_storyboarder(state: StudioState) -> StudioState:
             return state
         # Dialogue is approved upstream. Do not let the storyboard model
         # silently rewrite it while converting the plan into render JSON.
-        approved = state.get("dialogue_plan", {}).get("dialogues", [])
-        by_panel: dict[int, list[dict]] = {}
-        for item in approved:
-            panel_number = _panel_number(item.get("panel", 0))
-            character_id = item.get("character_id") or item.get("character")
-            if panel_number > 0 and character_id and item.get("text"):
-                by_panel.setdefault(panel_number, []).append({
-                    "character_id": character_id,
-                    "text": item["text"],
-                    "emotion": item.get("emotion", "neutral"),
-                })
-        for page in schema.get("pages", []):
-            for index, panel in enumerate(page.get("panels", []), start=1):
-                panel_number = (int(page.get("page_number", 1)) - 1) * 6 + index
-                # The dialogue plan is authoritative, including an explicit
-                # empty list for an intentional silent beat. Leaving the
-                # storyboard model's fallback dialogue in place caused Vision
-                # QA to reject otherwise valid silent panels.
-                panel["dialogues"] = by_panel.get(panel_number, [])
+        normalization_notes = merge_approved_dialogues(
+            schema,
+            state.get("dialogue_plan", {}),
+            state.get("story_plan", {}),
+        )
+        state["normalization_notes"] = normalization_notes
+        for note in normalization_notes:
+            logger.info("Storyboard accepted with safe normalization: %s", note)
         # The renderer operates on each panel independently. Repeat the fixed
         # cast and the one setting in every visual brief so an SD image cannot
         # drift into an unrelated portrait or room on later panels.
@@ -486,48 +584,78 @@ def run_storyboarder(state: StudioState) -> StudioState:
     return state
 
 def run_validator(state: StudioState) -> StudioState:
-    print("[ART DIRECTOR] Validating JSON Schema...")
+    """Route only deterministic storyboard-data failures back to the LLM.
+
+    Storyboards are drafts for the user to inspect and edit.  An Art Director
+    opinion can be useful feedback, but must never turn a structurally valid
+    draft into an invisible retry loop.
+    """
+    print("[VALIDATOR] Checking storyboard structure...")
     retry_count = int(state.get("retry_count", 0))
     max_retries = int(state.get("max_retries", 3))
-    if state.get("validation_errors"):
+    attempt = retry_count + 1
+    structural_errors = validate_storyboard_structure(
+        state.get("current_schema", {}),
+        max(1, int(state.get("pageCount", 1))),
+    )
+    errors = list(state.get("validation_errors", [])) + structural_errors
+    if errors:
+        state["validation_errors"] = list(dict.fromkeys(errors))
+        logger.warning(
+            "Storyboard generation attempt %s (retry limit %s) rejected: %s",
+            attempt,
+            max_retries,
+            " | ".join(state["validation_errors"]),
+        )
         if retry_count >= max_retries:
-            state["generation_error"] = "The storyboard did not pass quality checks after the maximum number of retries."
+            state["generation_error"] = "The storyboard did not pass structural checks after the maximum number of retries."
+            logger.error(
+                "Storyboard generation failed after attempt %s with retry limit %s: %s",
+                attempt,
+                max_retries,
+                " | ".join(state["validation_errors"]),
+            )
             state["next_step"] = "failed"
             return state
         state["retry_count"] = retry_count + 1
-        state["next_step"] = "storyboarder" # Force retry
+        state["next_step"] = "storyboarder"
+        logger.info(
+            "Requesting storyboard regeneration after attempt %s (retry %s of %s).",
+            attempt,
+            state["retry_count"],
+            max_retries,
+        )
         return state
-        
-    schema_str = json.dumps(state["current_schema"])
+
+    # Creative review is disabled for the normal interactive workflow.  The
+    # user reviews the valid draft in the UI before any image generation.
+    if os.getenv("ART_DIRECTOR_ENABLED", "false").strip().lower() not in {"1", "true", "yes"}:
+        state["validation_errors"] = []
+        state["retry_count"] = 0
+        state["next_step"] = "renderer"
+        status = "safely normalized" if state.get("normalization_notes") else "accepted"
+        logger.info("Storyboard generation attempt %s accepted (%s).", attempt, status)
+        return state
+
+    # If explicitly enabled, retain the review as non-blocking feedback.  Its
+    # content cannot alter validation_errors or route the graph to storyboarder.
+    schema_str = json.dumps(state["current_schema"], ensure_ascii=False)
     prompt = ChatPromptTemplate.from_messages([
         ("system", ART_DIRECTOR_SYSTEM_PROMPT),
         ("human", ART_DIRECTOR_HUMAN_PROMPT)
     ])
-    
-    chain = prompt | llm
-    res = chain.invoke({"schema": schema_str, "idea": state["user_prompt"], "pages": state.get("pageCount", 1)})
-    
-    # IMPORTANT: use an exact match, not a substring check.
-    # "SUCCESS" in "NOT SUCCESSFUL".upper() is True, which used to let
-    # rejected/low-quality scripts (no punchline, flat dialogue, etc.)
-    # through to the renderer without ever being fixed.
-    verdict = res.content.strip().strip("*").strip().rstrip(".!").upper()
-    if verdict == "SUCCESS":
-        state["validation_errors"] = []
-        # Art Director retries and Vision QA retries are separate budgets.  A
-        # storyboard that passed here must get a fresh validation budget when
-        # Vision QA sends it back for a targeted correction; otherwise the
-        # first rejected render can exhaust the storyboard retry counter and
-        # terminate the graph before the correction is rendered.
-        state["retry_count"] = 0
-        state["next_step"] = "renderer"
-    else:
-        state["validation_errors"] = [res.content]
-        if retry_count >= max_retries:
-            state["generation_error"] = "The storyboard did not pass quality checks after the maximum number of retries."
-            state["next_step"] = "failed"
-        else:
-            state["retry_count"] = retry_count + 1
-            state["next_step"] = "storyboarder"
-        
+    try:
+        result = (prompt | llm).invoke({
+            "schema": schema_str,
+            "idea": state["user_prompt"],
+            "pages": state.get("pageCount", 1),
+        })
+        state["art_director_feedback"] = str(result.content).strip()
+    except Exception as exc:
+        state["art_director_feedback"] = f"Art Director feedback unavailable: {exc}"
+    state["validation_errors"] = []
+    state["retry_count"] = 0
+    state["next_step"] = "renderer"
+    status = "safely normalized" if state.get("normalization_notes") else "accepted"
+    logger.info("Storyboard generation attempt %s accepted (%s; Art Director feedback is non-blocking).", attempt, status)
     return state

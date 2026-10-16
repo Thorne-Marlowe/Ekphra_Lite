@@ -7,7 +7,13 @@ from typing import Optional, Tuple, List, Dict, Set
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
-from .segment import detect_character_bbox_mediapipe
+# Segmentation is optional. The previous repository referenced a deleted local
+# module, which prevented every bubble from rendering.
+try:
+    from .segment import detect_character_bbox_mediapipe
+except ImportError:
+    def detect_character_bbox_mediapipe(image):
+        return None
 from style.fonts import load_font, get_font_name_for_emotion
 
 BUBBLE_STYLES: Dict[str, Dict] = {
@@ -526,58 +532,7 @@ def find_character_bounding_box(image: Image.Image) -> Optional[Tuple[int, int, 
     bbox = detect_character_bbox_mediapipe(image)
     if bbox:
         return bbox
-
-    try:
-        from rembg import remove, new_session
-        import io
-
-        global _REMBG_SESSION
-        if '_REMBG_SESSION' not in globals():
-            print("[BUBBLE] Initializing rembg session (runs only once)...")
-            _REMBG_SESSION = new_session("u2net")
-
-        # Downscale image to avoid ONNX OOM on high-res panels
-        original_width, original_height = image.size
-        max_dim = 512
-        scale = 1.0
-        if original_width > max_dim or original_height > max_dim:
-            scale = max_dim / max(original_width, original_height)
-            new_w, new_h = int(original_width * scale), int(original_height * scale)
-            process_image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        else:
-            process_image = image
-
-        img_bytes = io.BytesIO()
-        process_image.save(img_bytes, format="PNG")
-        img_bytes.seek(0)
-
-        output_bytes = remove(img_bytes.getvalue(), session=_REMBG_SESSION)
-        mask_image = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
-        mask_array = np.array(mask_image.split()[3])
-
-        foreground_pixels = np.where(mask_array > 128)
-
-        if len(foreground_pixels[0]) == 0:
-            return None
-
-        min_y = int(np.min(foreground_pixels[0]) / scale)
-        max_y = int(np.max(foreground_pixels[0]) / scale)
-        min_x = int(np.min(foreground_pixels[1]) / scale)
-        max_x = int(np.max(foreground_pixels[1]) / scale)
-
-        width, height = image.size
-        padding_x = int((max_x - min_x) * 0.1)
-        padding_y = int((max_y - min_y) * 0.1)
-
-        left = max(0, min_x - padding_x)
-        top = max(0, min_y - padding_y)
-        right = min(width, max_x + padding_x)
-        bottom = min(height, max_y + padding_y)
-
-        return (left, top, right - left, bottom - top)
-    except Exception as e:
-        print(f"[WARN] Character detection failed: {e}")
-        return None
+    return None
 
 def split_text_into_bubbles(text: str) -> List[str]:
     if not text.strip():

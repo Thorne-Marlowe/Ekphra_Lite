@@ -1,4 +1,2 @@
-from .stable_diffusion import SD
-
-__all__ = ["SD"]
+"""Reserved for application-local, non-inference helpers."""
 

@@ -27,30 +27,19 @@ class PathConfig:
     output_page: str = "comic_page.png"
 
 @dataclass
-class ModelConfig:
-    base_model: str = "models/base/comicBabes_v2.safetensors"
-    lora_scale: float = 1.0
-    negative_prompt_extra: str = "bad anatomy, extra limbs, text artifact"
-    negative_embedding: str | None = None
-    device: str = "cuda"
-
-@dataclass
-class QualityConfig:
-    panel_steps: int = 80
-    max_render_width: int = 896
-    max_render_height: int = 896
-
-    def __post_init__(self):
-        self.max_render_width = max(256, self.max_render_width)
-        self.max_render_height = max(256, self.max_render_height)
-
-@dataclass
-class StyleConfig:
-    preset: str = "flat_comic"
-
-@dataclass
 class StoryConfig:
     max_retries: int = 3
+
+@dataclass
+class ComfyUIConfig:
+    base_url: str = "http://127.0.0.1:8188"
+    profiles_file: str = "renderer_profiles.json"
+    timeout_seconds: int = 600
+    poll_seconds: float = 1.0
+
+@dataclass
+class VisionConfig:
+    enabled: bool = False
 
 @dataclass
 class PanelConfig:
@@ -70,28 +59,25 @@ class PageConfig:
 @dataclass
 class Config:
     paths: PathConfig = None
-    models: ModelConfig = None
-    quality: QualityConfig = None
     story: StoryConfig = None
-    style: StyleConfig = None
     page: PageConfig = None
     panel: PanelConfig = None
+    comfyui: ComfyUIConfig = None
+    vision: VisionConfig = None
     
     def __post_init__(self):
         if self.paths is None:
             self.paths = PathConfig()
-        if self.models is None:
-            self.models = ModelConfig()
-        if self.quality is None:
-            self.quality = QualityConfig()
         if self.story is None:
             self.story = StoryConfig()
-        if self.style is None:
-            self.style = StyleConfig()
         if self.page is None:
             self.page = PageConfig()
         if self.panel is None:
             self.panel = PanelConfig()
+        if self.comfyui is None:
+            self.comfyui = ComfyUIConfig()
+        if self.vision is None:
+            self.vision = VisionConfig()
 
     def to_dict(self):
         import dataclasses
@@ -101,24 +87,21 @@ class Config:
         if 'paths' in data:
             for k, v in data['paths'].items():
                 if hasattr(self.paths, k): setattr(self.paths, k, v)
-        if 'models' in data:
-            for k, v in data['models'].items():
-                if hasattr(self.models, k): setattr(self.models, k, v)
-        if 'quality' in data:
-            for k, v in data['quality'].items():
-                if hasattr(self.quality, k): setattr(self.quality, k, v)
         if 'story' in data:
             for k, v in data['story'].items():
                 if hasattr(self.story, k): setattr(self.story, k, v)
-        if 'style' in data:
-            for k, v in data['style'].items():
-                if hasattr(self.style, k): setattr(self.style, k, v)
         if 'page' in data:
             for k, v in data['page'].items():
                 if hasattr(self.page, k): setattr(self.page, k, v)
         if 'panel' in data:
             for k, v in data['panel'].items():
                 if hasattr(self.panel, k): setattr(self.panel, k, v)
+        if 'comfyui' in data:
+            for k, v in data['comfyui'].items():
+                if hasattr(self.comfyui, k): setattr(self.comfyui, k, v)
+        if 'vision' in data:
+            for k, v in data['vision'].items():
+                if hasattr(self.vision, k): setattr(self.vision, k, v)
 
 CONFIG = Config()
 

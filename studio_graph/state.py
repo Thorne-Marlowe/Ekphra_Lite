@@ -24,6 +24,11 @@ class StudioState(TypedDict):
     generation_error: str
     story_plan: dict
     dialogue_plan: dict
+    # Safe, deterministic cross-stage ID repairs applied to dialogue only.
+    normalization_notes: List[str]
     vision_qa: dict
+    # Optional creative-review text. It is informational and never controls
+    # storyboard retry routing.
+    art_director_feedback: str
     vision_retry_count: int
     max_vision_retries: int

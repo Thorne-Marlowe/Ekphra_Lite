@@ -1,0 +1,41 @@
+# Python environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local model weights
+models/
+*.safetensors
+*.ckpt
+*.gguf
+
+# Generated outputs
+outputs/
+
+# Temporary files
+*.log
+*.tmp
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+
+# Local renderer configuration
+renderer_profiles.json

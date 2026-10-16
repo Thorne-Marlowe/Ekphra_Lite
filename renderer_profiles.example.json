@@ -1,0 +1,22 @@
+{
+  "profiles": {
+    "flux2-klein-base-9b": {
+      "label": "FLUX.2 Klein Base 9B",
+      "description": "Bind this profile to the exported API workflow that loads Klein Base 9B.",
+      "workflow_path": "workflows/flux2-klein-base-9b_api.json",
+      "input_map": {
+        "positive_prompt": { "node_id": "REPLACE_WITH_NODE_ID", "input_name": "text" }
+      },
+      "output_node_id": "REPLACE_WITH_SAVE_IMAGE_NODE_ID"
+    },
+    "krea-2": {
+      "label": "Krea 2",
+      "description": "Bind this profile to the exported API workflow that loads Krea 2.",
+      "workflow_path": "workflows/krea-2_api.json",
+      "input_map": {
+        "positive_prompt": { "node_id": "REPLACE_WITH_NODE_ID", "input_name": "text" }
+      },
+      "output_node_id": "REPLACE_WITH_SAVE_IMAGE_NODE_ID"
+    }
+  }
+}

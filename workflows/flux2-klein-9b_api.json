@@ -1,0 +1,204 @@
+{
+  "9": {
+    "inputs": {
+      "filename_prefix": "Flux2-Klein",
+      "images": [
+        "157",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "114": {
+    "inputs": {
+      "noise_seed": 299955909870984
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "144": {
+    "inputs": {
+      "unet_name": "FLUX2\\flux-2-klein-9b-Q5_K_M.gguf"
+    },
+    "class_type": "UnetLoaderGGUF",
+    "_meta": {
+      "title": "Unet Loader (GGUF)"
+    }
+  },
+  "146": {
+    "inputs": {
+      "vae_name": "FLUX2\\full_encoder_small_decoder.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "147": {
+    "inputs": {
+      "clip_name": "QWEN3\\Qwen3-8B-Q6_K.gguf",
+      "type": "flux2"
+    },
+    "class_type": "CLIPLoaderGGUF",
+    "_meta": {
+      "title": "CLIPLoader (GGUF)"
+    }
+  },
+  "148": {
+    "inputs": {
+      "text": "A photorealistic, cinematic night scene: A young, cute woman with fair skin and black hair tied in a neat bun sits gracefully on a thick, moss-covered tree branch, gazing downward with a contemplative expression. She wears a detached laced collar, an elaborate black gothic Lolita-style low-cut dress, showing cleavage, lace-trimmed, with sheer long sleeves, a corseted bodice, and a layered, ruffled skirt that ends above her knees. Her footwear is a pair of chunky black platform Mary Jane shoes with multiple straps and buckles. The setting is a dense forest at night, under a massive, highly detailed full moon with visible craters and shadows, casting a cool, ethereal glow through the clouds. The tree’s bark is rugged and textured, with green leaves and vines clinging to its branches. In the background, blurred distant mountains and faint city lights suggest a hidden, mystical world. The atmosphere is moody, mysterious, and immersive, with soft ambient lighting emphasizing the textures of fabric, moss, and wood. High detail, realistic textures, dramatic chiaroscuro lighting, shallow depth of field, 8K resolution, ultra-realistic photography style, shot from a low angle to emphasize the subject’s isolation and beauty within the natural environment.",
+      "clip": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "149": {
+    "inputs": {
+      "text": "worst quality, lowres, cgi, 3D, anime, cartoon",
+      "clip": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Negative Prompt)"
+    }
+  },
+  "150": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Width"
+    }
+  },
+  "151": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Height"
+    }
+  },
+  "152": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "144",
+        0
+      ],
+      "positive": [
+        "148",
+        0
+      ],
+      "negative": [
+        "149",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider"
+    }
+  },
+  "153": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "154": {
+    "inputs": {
+      "noise": [
+        "114",
+        0
+      ],
+      "guider": [
+        "152",
+        0
+      ],
+      "sampler": [
+        "153",
+        0
+      ],
+      "sigmas": [
+        "155",
+        0
+      ],
+      "latent_image": [
+        "156",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "155": {
+    "inputs": {
+      "steps": 4,
+      "width": [
+        "150",
+        0
+      ],
+      "height": [
+        "151",
+        0
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "156": {
+    "inputs": {
+      "width": [
+        "150",
+        0
+      ],
+      "height": [
+        "151",
+        0
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": {
+      "title": "Empty Flux 2 Latent"
+    }
+  },
+  "157": {
+    "inputs": {
+      "samples": [
+        "154",
+        0
+      ],
+      "vae": [
+        "146",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  }
+}

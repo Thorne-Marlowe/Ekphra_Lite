@@ -8,6 +8,21 @@ from comfyui.profiles import RendererProfileStore
 
 
 class RendererProfileTests(unittest.TestCase):
+    def test_klein_profile_binds_the_checked_in_api_workflow_prompt_and_output(self):
+        root = Path(__file__).resolve().parents[1]
+        profile = RendererProfileStore(root / "renderer_profiles.json", root).get("flux2-klein-base-9b")
+
+        workflow = profile.load_workflow(root)
+        original_prompt = workflow["148"]["inputs"]["text"]
+        bound = profile.apply_inputs(workflow, {"positive_prompt": "a comic panel test prompt"})
+
+        self.assertEqual(profile.output_node_id, "9")
+        self.assertEqual(bound["148"]["inputs"]["text"], "a comic panel test prompt")
+        self.assertEqual(workflow["148"]["inputs"]["text"], original_prompt)
+        self.assertEqual(bound["9"]["class_type"], "SaveImage")
+        self.assertEqual(bound["144"]["inputs"]["unet_name"], workflow["144"]["inputs"]["unet_name"])
+        self.assertEqual(bound["155"]["inputs"]["steps"], workflow["155"]["inputs"]["steps"])
+
     def test_profile_binds_declared_inputs_without_guessing_nodes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

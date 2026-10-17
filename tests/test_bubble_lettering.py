@@ -13,7 +13,9 @@ from bubbles.injector import (
     inject_bubbles_to_page,
     normalize_lettering_text,
     panel_font_size,
+    speaker_target_from_position,
 )
+from page.builder import build_comic_page
 
 
 class BubbleLetteringTests(unittest.TestCase):
@@ -50,7 +52,7 @@ class BubbleLetteringTests(unittest.TestCase):
 
         self.assertEqual(observed_existing_counts, [0, 1])
 
-    def test_multiple_sentences_receive_non_overlapping_bubbles(self):
+    def test_multiple_sentences_remain_in_one_wrapped_bubble(self):
         with self._page_fixture({
             "dialogues": [{"character_id": "a", "text": "First sentence. Second sentence.", "emotion": ""}],
             "required_text": [],
@@ -59,8 +61,62 @@ class BubbleLetteringTests(unittest.TestCase):
             with patch("bubbles.injector.draw_speech_bubble", side_effect=lambda **kwargs: drawn.append(kwargs["bbox"])):
                 inject_bubbles_to_page(page, str(schema_path), str(panels_dir), [(0, 0, 500, 700)], ["p1"])
 
-        self.assertEqual(len(drawn), 2)
-        self.assertFalse(_rects_overlap(drawn[0], drawn[1], margin=0))
+        self.assertEqual(len(drawn), 1)
+
+    def test_distinct_dialogue_entries_remain_distinct_bubbles_in_order(self):
+        with self._page_fixture({
+            "dialogues": [{"character_id": "a", "text": "First line.", "emotion": ""}, {"character_id": "a", "text": "Second line.", "emotion": ""}],
+            "required_text": [],
+        }) as (page, schema_path, panels_dir):
+            drawn = []
+            with patch("bubbles.injector.draw_speech_bubble", side_effect=lambda **kwargs: drawn.append(kwargs["text_lines"])):
+                inject_bubbles_to_page(page, str(schema_path), str(panels_dir), [(0, 0, 500, 700)], ["p1"])
+        self.assertEqual([" ".join(lines) for lines in drawn], ["First line.", "Second line."])
+
+    def test_metadata_target_uses_panel_to_page_coordinates_without_segmentation(self):
+        self.assertEqual(speaker_target_from_position({"x": "right", "y": "bottom", "anchor": "center"}, (100, 200, 500, 700)), (500, 760))
+        self.assertIsNone(speaker_target_from_position(None, (0, 0, 500, 700)))
+
+    def test_long_unbroken_word_wraps_without_losing_characters(self):
+        with self._page_fixture({"dialogues": [{"character_id": "a", "text": "SUPERCALIFRAGILISTICEXPIALIDOCIOUS", "emotion": ""}], "required_text": []}) as (page, schema_path, panels_dir):
+            drawn = []
+            with patch("bubbles.injector.draw_speech_bubble", side_effect=lambda **kwargs: drawn.append(kwargs["text_lines"])):
+                inject_bubbles_to_page(page, str(schema_path), str(panels_dir), [(0, 0, 500, 700)], ["p1"])
+        self.assertEqual("".join(drawn[0]), "SUPERCALIFRAGILISTICEXPIALIDOCIOUS")
+
+    def test_oversized_dialogue_identifies_panel_and_entry(self):
+        with self._page_fixture({"dialogues": [{"character_id": "a", "text": "word " * 600, "emotion": ""}], "required_text": []}) as (page, schema_path, panels_dir):
+            with self.assertRaisesRegex(ValueError, r"Lettering overflow in panel p1, dialogue 1"):
+                inject_bubbles_to_page(page, str(schema_path), str(panels_dir), [(0, 0, 500, 700)], ["p1"])
+
+    def test_last_melody_lena_target_does_not_require_segmentation(self):
+        with self._page_fixture({
+            "active_char_ids": ["jai", "lena"],
+            "character_positions": {"jai": {"x": "left", "y": "middle", "anchor": "center"}, "lena": {"x": "right", "y": "bottom", "anchor": "center"}},
+            "dialogues": [{"character_id": "lena", "text": "I think I know the next part.", "emotion": "hopeful"}], "required_text": [],
+        }) as (page, schema_path, panels_dir):
+            schema = json.loads(Path(schema_path).read_text())
+            schema["characters"] = {"jai": {"name": "Jai", "base_prompt_en": "test"}, "lena": {"name": "Lena", "base_prompt_en": "test"}}
+            Path(schema_path).write_text(json.dumps(schema))
+            captured = []
+            with patch("bubbles.injector.find_character_bounding_box", return_value=None), \
+                    patch("bubbles.injector.draw_speech_bubble", side_effect=lambda **kwargs: captured.append(kwargs["speaker_target"])):
+                inject_bubbles_to_page(page, str(schema_path), str(panels_dir), [(100, 200, 500, 700)], ["p1"])
+        self.assertEqual(captured, [(500, 760)])
+
+    def test_bypassed_malformed_position_metadata_fails_descriptively(self):
+        with self._page_fixture({
+            "character_positions": {"a": "left"},
+            "dialogues": [{"character_id": "a", "text": "Hello", "emotion": ""}], "required_text": [],
+        }) as (page, schema_path, panels_dir):
+            with self.assertRaisesRegex(ValueError, r"panel p1: character_positions.a must be an object"):
+                inject_bubbles_to_page(page, str(schema_path), str(panels_dir), [(0, 0, 500, 700)], ["p1"])
+
+    def test_bubble_failure_propagates_from_page_composition(self):
+        with self._page_fixture({"dialogues": [{"character_id": "a", "text": "Hello", "emotion": ""}], "required_text": []}) as (_page, schema_path, panels_dir):
+            with patch("bubbles.injector.inject_bubbles_to_page", side_effect=ValueError("Lettering overflow in panel p1, dialogue 1")):
+                with self.assertRaisesRegex(ValueError, "Lettering overflow"):
+                    build_comic_page(str(panels_dir), str(Path(schema_path).with_name("page.png")), ["p1"], str(schema_path))
 
     def test_insufficient_space_raises_instead_of_overlapping(self):
         with self.assertRaisesRegex(ValueError, "No non-overlapping lettering position"):

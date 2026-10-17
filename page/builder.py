@@ -271,17 +271,10 @@ def build_comic_page(
                 panel_positions.append((x, y, resized.width, resized.height))
     
     if inject_bubbles and schema_path:
-        try:
-            from bubbles.injector import inject_bubbles_to_page
-            page = inject_bubbles_to_page(
-                page, 
-                schema_path, 
-                panels_dir, 
-                panel_positions, 
-                expected_panel_ids=expected_panel_ids
-            )
-        except Exception as e:
-            print(f"[WARN] Bubble injection failed: {e}")
+        from bubbles.injector import inject_bubbles_to_page
+        page = inject_bubbles_to_page(
+            page, schema_path, panels_dir, panel_positions, expected_panel_ids=expected_panel_ids
+        )
     
     output_path_obj = Path(output_path)
     output_path_obj.parent.mkdir(parents=True, exist_ok=True)

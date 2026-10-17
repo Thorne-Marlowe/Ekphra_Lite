@@ -63,6 +63,21 @@ def wrap_text_to_lines(
         current_line: List[str] = []
         
         for word in words:
+            if font.getbbox(word)[2] - font.getbbox(word)[0] > max_width:
+                if current_line:
+                    lines.append(" ".join(current_line))
+                    current_line = []
+                chunk = ""
+                for character in word:
+                    candidate = chunk + character
+                    if chunk and font.getbbox(candidate)[2] - font.getbbox(candidate)[0] > max_width:
+                        lines.append(chunk)
+                        chunk = character
+                    else:
+                        chunk = candidate
+                if chunk:
+                    current_line = [chunk]
+                continue
             test_line = " ".join(current_line + [word])
             bbox = font.getbbox(test_line)
             line_width = bbox[2] - bbox[0]
@@ -826,6 +841,7 @@ def draw_speech_bubble(
     font: ImageFont.FreeTypeFont,
     style: Dict,
     character_bbox: Optional[Tuple[int, int, int, int]] = None,
+    speaker_target: Optional[Tuple[int, int]] = None,
 ):
     x, y, width, height = bbox
     fill_color = (255, 255, 255)
@@ -848,6 +864,9 @@ def draw_speech_bubble(
             char_left + char_width // 2,
             char_top + int(char_height * 0.3),
         )
+
+    if not tail_target and speaker_target:
+        tail_target = speaker_target
 
     draw_bubble_tail(
         draw,
@@ -873,29 +892,15 @@ def draw_speech_bubble(
     # Đảm bảo text không vượt quá bubble width (trừ padding)
     available_text_width = max(40, width - 24)  # Padding 12px mỗi bên, minimum 40px
 
+    if total_text_height > height - 24:
+        raise ValueError("Lettering text does not fit within bubble height.")
+
     for line in text_lines:
         bbox = font.getbbox(line)
         text_width = bbox[2] - bbox[0]
         
-        # Nếu text quá dài, cắt ngắn lại
         if text_width > available_text_width:
-            # Tìm vị trí cắt gần nhất
-            words = line.split()
-            truncated_line = ""
-            for word in words:
-                test_line = truncated_line + (" " if truncated_line else "") + word
-                test_bbox = font.getbbox(test_line)
-                test_width = test_bbox[2] - test_bbox[0]
-                if test_width <= available_text_width:
-                    truncated_line = test_line
-                else:
-                    break
-            if not truncated_line:
-                # Nếu không thể wrap, cắt ký tự
-                truncated_line = line[:max(1, len(line) * available_text_width // text_width)]
-            line = truncated_line
-            bbox = font.getbbox(line)
-            text_width = bbox[2] - bbox[0]
+            raise ValueError("Lettering line exceeds bubble interior width.")
         
         # Đảm bảo text không vượt quá bubble bounds
         text_x = max(x + 12, min(x + (width - text_width) // 2, x + width - text_width - 12))
@@ -996,6 +1001,36 @@ def _extract_all_panels_from_schema(data: dict) -> list:
         panels_data = data.get("panels", [])
     return panels_data
 
+
+def _position_fraction(value: object, axis: str) -> float | None:
+    labels = {"x": {"left": 0.2, "center": 0.5, "right": 0.8}, "y": {"top": 0.2, "middle": 0.5, "bottom": 0.8}}
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= float(value) <= 1:
+        return float(value)
+    if isinstance(value, str):
+        return labels[axis].get(value.strip().casefold())
+    return None
+
+
+def speaker_target_from_position(position: object, panel_bounds: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+    """Return an approximate page-space speaker point from authored metadata."""
+    if not isinstance(position, dict) or position.get("anchor", "center") != "center":
+        return None
+    x_fraction = _position_fraction(position.get("x", "center"), "x")
+    y_fraction = _position_fraction(position.get("y", "middle"), "y")
+    if x_fraction is None or y_fraction is None:
+        return None
+    x, y, width, height = panel_bounds
+    return int(x + width * x_fraction), int(y + height * y_fraction)
+
+
+def _speaker_preferred_location(target: Optional[Tuple[int, int]], panel_bounds: Tuple[int, int, int, int], width: int, height: int) -> Tuple[int, int]:
+    panel_x, panel_y, panel_w, panel_h = panel_bounds
+    if not target:
+        return panel_x + 20, panel_y + 20
+    target_x, target_y = target
+    y = panel_y + 20 if target_y >= panel_y + panel_h // 2 else panel_y + panel_h - height - 20
+    return target_x - width // 2, y
+
 def get_all_character_bboxes_on_page(
     page: Image.Image,
     schema_path: str,
@@ -1058,13 +1093,11 @@ def inject_bubbles_to_page(
         with open(schema_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        print(f"[WARN] Cannot load schema: {e}")
-        return page
+        raise ValueError(f"Cannot inject lettering: unable to load storyboard schema: {e}") from e
     
     panels_data = _extract_all_panels_from_schema(data)
     if not panels_data:
-        print(f"[WARN] No panels found in schema (checked both 'pages' and 'panels' keys)")
-        return page
+        raise ValueError("Cannot inject lettering: storyboard contains no panels.")
     
     result = page.copy()
     draw = ImageDraw.Draw(result)
@@ -1098,6 +1131,8 @@ def inject_bubbles_to_page(
             i = panels_data.index(panel_data)
 
         dialogues = panel_data.get("dialogues", [])
+        if not isinstance(dialogues, list):
+            raise ValueError(f"Cannot inject lettering for panel {panel_id}: dialogues must be an array.")
         if not dialogues:
             continue
         
@@ -1107,13 +1142,12 @@ def inject_bubbles_to_page(
             
         pfile = panel_path / f"{panel_id}.png"
         if not pfile.exists():
-            continue
+            raise ValueError(f"Cannot inject lettering for panel {panel_id}: panel image is missing.")
 
         try:
             panel_image = Image.open(pfile).convert("RGB")
         except Exception as e:
-            print(f"[WARN] Failed to open {pfile}: {e}")
-            continue
+            raise ValueError(f"Cannot inject lettering for panel {panel_id}: panel image is unreadable: {e}") from e
 
         if panel_positions and i < len(panel_positions):
             panel_x, panel_y, panel_w, panel_h = panel_positions[i]
@@ -1132,6 +1166,19 @@ def inject_bubbles_to_page(
         character_bbox = find_character_bounding_box(panel_image)
         
         character_positions = panel_data.get("character_positions", {})
+        if not isinstance(character_positions, dict):
+            raise ValueError(f"Cannot inject lettering for panel {panel_id}: character_positions must be an object.")
+        for positioned_character_id, position in character_positions.items():
+            if not isinstance(position, dict):
+                raise ValueError(
+                    f"Cannot inject lettering for panel {panel_id}: "
+                    f"character_positions.{positioned_character_id} must be an object."
+                )
+            if speaker_target_from_position(position, (panel_x, panel_y, panel_w, panel_h)) is None:
+                raise ValueError(
+                    f"Cannot inject lettering for panel {panel_id}: "
+                    f"character_positions.{positioned_character_id} has unsupported x, y, or anchor values."
+                )
         
         char_bbox_map = {}
         if character_bbox:
@@ -1170,39 +1217,32 @@ def inject_bubbles_to_page(
                 int(char_height * scale_y),
             )
         
-        for dialogue in dialogues:
+        for dialogue_index, dialogue in enumerate(dialogues, start=1):
+            if not isinstance(dialogue, dict):
+                raise ValueError(f"Cannot inject lettering for panel {panel_id}, dialogue {dialogue_index}: entry must be an object.")
             text = dialogue.get("text", "")
             character_id = dialogue.get("character_id", "")
             if not text:
                 continue
             
             char_bbox = char_bbox_map.get(character_id, default_char_bbox)
+            speaker_target = speaker_target_from_position(
+                character_positions.get(character_id), (panel_x, panel_y, panel_w, panel_h)
+            )
+            # A single segmentation result is not a speaker-specific box.
+            # Metadata placement therefore uses only its approximate target.
+            if speaker_target is not None:
+                char_bbox = None
             
             active_char_ids = panel_data.get("active_char_ids", [])
             if character_id not in active_char_ids:
                 print(f"[WARN] Dialogue character_id '{character_id}' not in active_char_ids {active_char_ids} for panel {i}")
             
-            for sentence in split_text_into_bubbles(text):
-                bubble_entries.append(
-                    {
-                        "text": sentence,
-                        "emotion": dialogue.get("emotion"),
-                        "character_id": character_id,
-                    }
-                )
-                bubble_panels.append(
-                    {
-                        "panel_idx": i,
-                        "char_bbox": char_bbox,
-                        "character_id": character_id,
-                        "panel_x": panel_x,
-                        "panel_y": panel_y,
-                        "panel_w": panel_w if panel_positions else page_width,
-                        "panel_h": panel_h
-                        if panel_positions
-                        else (page_height // len(panel_files) if panel_files else page_height),
-                    }
-                )
+            bubble_entries.append({"text": text, "emotion": dialogue.get("emotion"), "character_id": character_id, "dialogue_index": dialogue_index})
+            bubble_panels.append({"panel_idx": i, "panel_id": panel_id, "char_bbox": char_bbox, "speaker_target": speaker_target,
+                                  "character_id": character_id, "panel_x": panel_x, "panel_y": panel_y,
+                                  "panel_w": panel_w if panel_positions else page_width,
+                                  "panel_h": panel_h if panel_positions else page_height})
 
     # Composite authored required_text as simple readable captions after the
     # panel images are drawn.  This is derived only from the schema, so it
@@ -1265,6 +1305,7 @@ def inject_bubbles_to_page(
         text = entry["text"]
         emotion = entry.get("emotion")
         char_bbox = bubble_panel["char_bbox"]
+        speaker_target = bubble_panel["speaker_target"]
         panel_x = bubble_panel["panel_x"]
         panel_y = bubble_panel["panel_y"]
         panel_w = bubble_panel["panel_w"]
@@ -1327,18 +1368,15 @@ def inject_bubbles_to_page(
             int(text_height + bubble_padding_y * 2),
             min_bubble_height,
         )
-        bubble_height = min(bubble_height, int(panel_h * 0.60))
+        max_bubble_height = int(panel_h * 0.60)
+        if bubble_height > max_bubble_height:
+            raise ValueError(
+                f"Lettering overflow in panel {bubble_panel['panel_id']}, dialogue {entry['dialogue_index']}: "
+                "wrapped text does not fit within the allowed bubble height."
+            )
 
-        # Gọi find_bubble_position với existing_bubbles GLOBAL (chứa bubbles từ tất cả panels)
-        x, y = find_bubble_position(
-            bubble_width,
-            bubble_height,
-            (panel_x, panel_y, panel_w, panel_h),
-            char_bbox,
-            local_existing,
-            page_width,
-            page_height,
-            attempts=200,  # Tăng số attempts lên 200
+        x, y = _speaker_preferred_location(
+            speaker_target, (panel_x, panel_y, panel_w, panel_h), bubble_width, bubble_height
         )
         x, y = _place_bubble_without_overlap(
             (int(x), int(y)),
@@ -1361,6 +1399,7 @@ def inject_bubbles_to_page(
             font=font,
             style=style,
             character_bbox=char_bbox,
+            speaker_target=speaker_target,
         )
     
     return result

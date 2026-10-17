@@ -123,6 +123,26 @@ def validate_storyboard_structure(schema: Any, requested_pages: int) -> list[str
             for character_id in active_ids:
                 if character_id not in characters:
                     errors.append(f"{label} references unregistered character '{character_id}'.")
+            if "character_positions" in panel:
+                positions = panel.get("character_positions")
+                if not isinstance(positions, dict):
+                    errors.append(f"{label} character_positions must be an object.")
+                else:
+                    valid_x, valid_y = {"left", "center", "right"}, {"top", "middle", "bottom"}
+                    for character_id, position in positions.items():
+                        if character_id not in characters:
+                            errors.append(f"{label} character_positions references unregistered character '{character_id}'.")
+                        if not isinstance(position, dict):
+                            errors.append(f"{label} character_positions.{character_id} must be an object.")
+                            continue
+                        x, y, anchor = position.get("x", "center"), position.get("y", "middle"), position.get("anchor", "center")
+                        valid_number = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+                        if not (valid_number(x) or (isinstance(x, str) and x.casefold() in valid_x)):
+                            errors.append(f"{label} character_positions.{character_id}.x must be left, center, right, or a number from 0 to 1.")
+                        if not (valid_number(y) or (isinstance(y, str) and y.casefold() in valid_y)):
+                            errors.append(f"{label} character_positions.{character_id}.y must be top, middle, bottom, or a number from 0 to 1.")
+                        if anchor != "center":
+                            errors.append(f"{label} character_positions.{character_id}.anchor must be center.")
             if "dialogues" not in panel:
                 errors.append(f"{label} needs a dialogues array.")
             dialogues = panel.get("dialogues", [])

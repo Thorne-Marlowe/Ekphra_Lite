@@ -21,3 +21,14 @@ class StoryboardValidationTests(unittest.TestCase):
     def test_invalid_panel_count_remains_a_deterministic_error(self):
         malformed = {**VALID_FOUR_PANEL_STORYBOARD, "pages": [{**VALID_FOUR_PANEL_STORYBOARD["pages"][0], "panels": VALID_FOUR_PANEL_STORYBOARD["pages"][0]["panels"][:1]}]}
         self.assertEqual(validate_storyboard_structure(malformed, requested_pages=1), ["Page 1 must contain 2 to 6 panels, found 1."])
+
+    def test_optional_character_positions_are_validated_only_when_supplied(self):
+        malformed = {**VALID_FOUR_PANEL_STORYBOARD, "pages": [{**VALID_FOUR_PANEL_STORYBOARD["pages"][0], "panels": [
+            {**VALID_FOUR_PANEL_STORYBOARD["pages"][0]["panels"][0], "character_positions": {"unknown": {"x": "sideways", "y": "up", "anchor": "left"}}},
+            *VALID_FOUR_PANEL_STORYBOARD["pages"][0]["panels"][1:],
+        ]}]}
+        errors = validate_storyboard_structure(malformed, requested_pages=1)
+        self.assertIn("Page 1, panel 1 character_positions references unregistered character 'unknown'.", errors)
+        self.assertTrue(any(".x must be" in error for error in errors))
+        self.assertTrue(any(".y must be" in error for error in errors))
+        self.assertTrue(any(".anchor must be center" in error for error in errors))

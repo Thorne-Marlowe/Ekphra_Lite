@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -18,10 +20,18 @@ from comfyui.client import ComfyUIClient, ComfyUIError
 from comfyui.profiles import ProfileError, RendererProfileStore
 from config import CONFIG
 from panel_engine.comfy_renderer import render_comic_schema
-from panel_engine.job_status import completed_job_pages
+from panel_engine.job_status import completed_job_pages, load_manifest
 from page.layouts import compatible_layout_names
 from studio_graph.graph import create_storyboard_graph
 from utils.parser import load_comic_from_json
+from vision_qa.engine import (
+    CONFIDENCES,
+    PAGE_CATEGORIES,
+    RAW_CATEGORIES,
+    SEVERITIES,
+    VisionQAEngine,
+    VisionQAError,
+)
 
 load_dotenv()
 
@@ -104,6 +114,117 @@ def page_job_info(page_url: str) -> tuple[Path, str, int]:
     if len(parts) < 4 or parts[:2] != ["comic", "page"]:
         raise HTTPException(status_code=400, detail="Unsupported page URL")
     return page_path, "_".join(parts[2:-1]), int(parts[-1])
+
+
+_SAFE_JOB_OR_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
+_VISION_QA_STATUSES = {"completed", "partial", "unavailable"}
+_ASSESSMENT_STATUSES = {"assessed", "error"}
+
+
+def vision_qa_job_dir(job_id: str) -> Path:
+    """Return one completed job directory without accepting path fragments."""
+    if not isinstance(job_id, str) or not _SAFE_JOB_OR_RUN_ID.fullmatch(job_id):
+        raise HTTPException(status_code=422, detail="Invalid job ID.")
+    job_dir = output_dir / "jobs" / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Render job not found.")
+    manifest = load_manifest(job_dir)
+    if not isinstance(manifest, dict) or manifest.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Vision QA is available only for verified completed render jobs.")
+    return job_dir
+
+
+def _validate_qa_assessments(entries, *, page: bool) -> bool:
+    if not isinstance(entries, list):
+        return False
+    allowed_categories = PAGE_CATEGORIES if page else RAW_CATEGORIES
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("status") not in _ASSESSMENT_STATUSES:
+            return False
+        if page:
+            if not isinstance(entry.get("page_number"), int) or not isinstance(entry.get("panel_ids"), list):
+                return False
+        elif not isinstance(entry.get("panel_id"), str) or not isinstance(entry.get("page_number"), int):
+            return False
+        observations = entry.get("observations")
+        if not isinstance(observations, list):
+            return False
+        if entry["status"] == "assessed" and "error" in entry:
+            return False
+        if entry["status"] == "error" and (not isinstance(entry.get("error"), str) or not entry["error"].strip()):
+            return False
+        for observation in observations:
+            if not isinstance(observation, dict) or not all(
+                isinstance(observation.get(key), str) and observation[key]
+                for key in ("category", "severity", "confidence", "explanation")
+            ):
+                return False
+            if (observation["category"] not in allowed_categories
+                    or observation["severity"] not in SEVERITIES
+                    or observation["confidence"] not in CONFIDENCES):
+                return False
+            if (observation["category"] == "speaker_attribution"
+                    and observation["confidence"] == "not_assessable"
+                    and observation["severity"] != "info"):
+                return False
+    return True
+
+
+def _parse_qa_timestamp(value, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} is missing.")
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} is malformed.") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError(f"{label} must include a timezone.")
+    return timestamp
+
+
+def load_vision_qa_report(job_id: str, run_id: str) -> dict:
+    """Read a completed informational report from its job-local directory."""
+    job_dir = vision_qa_job_dir(job_id)
+    if not isinstance(run_id, str) or not _SAFE_JOB_OR_RUN_ID.fullmatch(run_id):
+        raise HTTPException(status_code=422, detail="Invalid Vision QA run ID.")
+    report_path = job_dir / "vision_qa" / f"{run_id}.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Vision QA report not found.") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail="Vision QA report is unavailable or malformed.") from exc
+    if (not isinstance(report, dict) or report.get("version") != 1
+            or report.get("job_id") != job_id or report.get("run_id") != run_id
+            or report.get("status") not in _VISION_QA_STATUSES
+            or not _validate_qa_assessments(report.get("raw_panels"), page=False)
+            or not _validate_qa_assessments(report.get("pages"), page=True)
+            or not isinstance(report.get("errors"), list)):
+        raise HTTPException(status_code=404, detail="Vision QA report is unavailable or malformed.")
+    try:
+        started_at = _parse_qa_timestamp(report.get("started_at"), "started_at")
+        completed_at = _parse_qa_timestamp(report.get("completed_at"), "completed_at")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"Vision QA report is unavailable or malformed: {exc}") from exc
+    if completed_at < started_at:
+        raise HTTPException(status_code=404, detail="Vision QA report is unavailable or malformed: completed_at precedes started_at.")
+    assessments = report["raw_panels"] + report["pages"]
+    assessed_count = sum(entry["status"] == "assessed" for entry in assessments)
+    if (not assessments
+            or (report["status"] == "completed" and assessed_count != len(assessments))
+            or (report["status"] == "partial" and not 0 < assessed_count < len(assessments))
+            or (report["status"] == "unavailable" and assessed_count != 0)):
+        raise HTTPException(status_code=404, detail="Vision QA report is unavailable or malformed.")
+    return report
+
+
+def vision_qa_summary(report: dict) -> dict:
+    return {
+        "runId": report["run_id"], "status": report["status"], "model": report.get("model"),
+        "startedAt": report["started_at"], "completedAt": report["completed_at"],
+        "rawPanelCount": len(report["raw_panels"]), "pageCount": len(report["pages"]),
+        "errorCount": len(report["errors"]),
+    }
 
 
 @app.get("/api/capabilities")
@@ -197,6 +318,49 @@ async def render_storyboard(req: RenderRequest):
 @app.get("/api/history")
 async def get_history():
     return {"history": ["/outputs/" + page.relative_to(output_dir).as_posix() for page in completed_job_pages(output_dir)]}
+
+
+@app.post("/api/jobs/{job_id}/vision-qa")
+async def run_manual_vision_qa(job_id: str):
+    """Run one explicitly requested QA pass off the event loop.
+
+    Large comics issue one sequential vision request for each raw panel and
+    composed page, so this synchronous endpoint can take several minutes.
+    """
+    vision_qa_job_dir(job_id)
+    try:
+        report_path = await asyncio.to_thread(VisionQAEngine(output_dir).run, job_id)
+    except VisionQAError as exc:
+        raise HTTPException(status_code=422, detail=f"Vision QA could not assess this job: {exc}") from exc
+    except Exception as exc:
+        logger.exception("Manual Vision QA failed for job %s", job_id)
+        raise HTTPException(status_code=502, detail=f"Vision QA execution failed: {exc}") from exc
+    report = load_vision_qa_report(job_id, Path(report_path).stem)
+    return {"report": report}
+
+
+@app.get("/api/jobs/{job_id}/vision-qa")
+async def list_vision_qa_reports(job_id: str):
+    job_dir = vision_qa_job_dir(job_id)
+    reports: list[tuple[datetime, str, dict]] = []
+    report_dir = job_dir / "vision_qa"
+    if report_dir.is_dir():
+        for report_path in report_dir.glob("*.json"):
+            run_id = report_path.stem
+            try:
+                report = load_vision_qa_report(job_id, run_id)
+                reports.append((_parse_qa_timestamp(report["completed_at"], "completed_at"), run_id, report))
+            except HTTPException:
+                # Pending, temporary, corrupt, or incomplete artifacts are not
+                # reports and deliberately remain invisible to callers.
+                continue
+    reports.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return {"jobId": job_id, "reports": [vision_qa_summary(report) for _, _, report in reports]}
+
+
+@app.get("/api/jobs/{job_id}/vision-qa/{run_id}")
+async def get_vision_qa_report(job_id: str, run_id: str):
+    return {"report": load_vision_qa_report(job_id, run_id)}
 
 
 @app.get("/api/page-meta")

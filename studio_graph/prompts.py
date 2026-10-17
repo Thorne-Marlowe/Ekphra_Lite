@@ -114,20 +114,20 @@ Register every visible character in characters, and list only those visible in e
 ## CORE RESPONSIBILITIES
 1. Break down the script for the current page into clear, visual panels.
 
-## STABLE DIFFUSION 1.5 OPTIMIZATION
+## CONCRETE VISUAL DESCRIPTION
 1. Character Descriptions (`base_prompt_en`):
-   - For human characters, use: [gender], [age], [ethnicity], [hair: color + style], [eyes: color], [clothing: style + colors], [key facial feature].
+    - Describe the stable visual identity needed to recognize the character across independently rendered panels: appearance, clothing/material, and one or two distinctive features.
    - For animal, robot, object, or fantasy characters, describe only their fixed visual identity: applicable species/type, fur/material color, distinctive markings, and one recognizable feature. Add eyes or accessories only when meaningful to that concept; never invent them for an inanimate object.
 2. Panel Prompts (`panel_prompt_en`):
-   - Structure: [CRITICAL: Emotion & Facial Expression] + [Action] + [Setting]
-   - You MUST extract the `Emotion:` from the Writer's script and explicitly inject it into the prompt (e.g., `angry expression, furrowed brows, crying`).
-   - DIALOGUE RULE: If a character speaks in this panel, you MUST include `speaking, talking, open mouth` in the `panel_prompt_en`. If they are shouting, use `shouting, yelling, wide open mouth`.
-   - Length: 20-40 words
+    - Describe one concrete, drawable instant: visible subject, pose/action, essential prop, setting, and expression when it matters.
+    - Do not describe a sequence using `then`, `after`, or multiple successive actions. Choose the single moment that best communicates the approved beat.
+    - Dialogue is lettered separately. Do not require an open mouth, talking pose, or speech keyword solely because a panel has dialogue.
+    - Include camera framing only when it is important to the intended image.
+    - Length: 12-30 words. Use natural, precise visual language rather than keyword piles.
 3. Action Descriptions (`action_en`):
-   - Format: Specific body parts + direction + object interaction
-   - Length: 15-25 words
-4. Negative Prompts (Critical for Quality):
-   - Always include: "blurry, distorted, deformed hands, extra fingers, bad anatomy, poorly drawn face, mutation, ugly, bad proportions, extra limbs, floating objects, disconnected limbs, text, watermark"
+    - Describe the same single visible moment as specific body position and object interaction when relevant.
+4. Negative prompt fields:
+    - Keep `panel_negative_en` available in the schema for renderer-specific workflows. Do not add a universal negative-keyword list.
 
 ## FLAWED CHARACTERS (CRITICAL FOR COMEDY)
 You MUST NOT create perfect, polite, or purely helpful characters. AI models tend to make characters too nice and stories too safe. You MUST break this habit.
@@ -180,7 +180,7 @@ You must output a JSON object with this exact structure:
         {{
           "id": "panel_1_1",
           "panel_prompt_en": "calm expression, holding a baby, baby vomiting green liquid violently onto father's face, messy living room",
-          "panel_negative_en": "Your negative prompt here",
+          "panel_negative_en": "",
           "active_char_ids": ["char_dad"],
           "character_actions": {{
             "char_dad": {{ "action_en": "holding baby", "pose_en": "sitting still" }}
@@ -203,7 +203,7 @@ You MUST design the characters in the `"characters"` block first. The `base_prom
 
 The backend system will automatically inject the `base_prompt_en` into the final prompt.
 Therefore, DO NOT copy-paste the character description into `panel_prompt_en`.
-Instead, keep `panel_prompt_en` concise (under 30 words). Only describe the ACTION, EXPRESSION, REQUIRED PROPS, and BACKGROUND.
+Instead, keep `panel_prompt_en` concise (12-30 words). Only describe the single visible moment, expression when meaningful, required props, setting, and any essential camera framing.
 Example `panel_prompt_en`: "running frantically through a dark forest, looking terrified, cinematic lighting"
 
 ## INSTRUCTIONS & PUNCHY DIALOGUE
@@ -292,7 +292,7 @@ panel immediately before the payoff when pacing allows. Avoid four unrelated jok
 or random absurdity. Return JSON only with title, language, tone, trope, characters (id, name, role, goal,
 personality_contrast, fixed_visual_identity), and beats (panel, role, event, required_subjects, required_action,
 required_props, required_text, dialogue_intent, payoff). Use `required_text` only for text that must be
-composited or checked verbatim (labels, signs, screens); use an empty list when the beat has no text.
+composited or checked verbatim (labels, signs, screens), never spoken dialogue; use an empty list when the beat has no text.
 The plan must explicitly mark the primary
 subject, secondary subject, and visual hierarchy for each beat; do not add characters
 that are not required by the user's idea."""

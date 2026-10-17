@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Image as ImageIcon, Pencil, RotateCcw, Save } from 'lucide-react'
 import { StoryboardRequestController } from './storyboardRequest'
 
@@ -6,6 +6,8 @@ type Dialogue = { character_id?: string; text?: string; emotion?: string }
 type PanelMeta = { id: string; x: number; y: number; width: number; height: number; prompt: string; dialogues: Dialogue[] }
 type PageMeta = { url: string; pageWidth: number; pageHeight: number; panels: PanelMeta[] }
 type Profile = { id: string; label: string; description: string }
+type LayoutMode = 'auto' | 'simple' | 'manual'
+type StoryboardPage = { number: number; count: number }
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
 
 export default function App() {
@@ -28,6 +30,10 @@ export default function App() {
   const [guidance, setGuidance] = useState('')
   const [negativePrompt, setNegativePrompt] = useState('')
   const [seed, setSeed] = useState('')
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>('auto')
+  const [pageLayouts, setPageLayouts] = useState<Record<string, string>>({})
+  const [imageFit, setImageFit] = useState<'cover' | 'contain'>('cover')
+  const [layouts, setLayouts] = useState<Record<string, string[]>>({})
   const storyboardRequest = useRef(new StoryboardRequestController())
 
   const api = async (path: string, body?: unknown, signal?: AbortSignal) => {
@@ -45,12 +51,28 @@ export default function App() {
     return data
   }
 
+  const storyboardPages = useMemo<StoryboardPage[]>(() => {
+    try {
+      const parsed = JSON.parse(draft)
+      return Array.isArray(parsed.pages) ? (parsed.pages as unknown[]).map((value, index) => {
+        const page = value as { page_number?: number; panels?: unknown[] }
+        return { number: page.page_number || index + 1, count: Array.isArray(page.panels) ? page.panels.length : 0 }
+      }) : []
+    } catch { return [] }
+  }, [draft])
+
+  const resolvedPageLayouts = () => Object.fromEntries(storyboardPages.map((page): [string, string] => {
+    const options = layouts[String(page.count)] || []
+    return [String(page.number), pageLayouts[String(page.number)] || options[0] || '']
+  }).filter(([, layout]: [string, string]) => Boolean(layout)))
+
   useEffect(() => {
     void api('/api/capabilities').then(data => {
       const items = Array.isArray(data.profiles) ? data.profiles as Profile[] : []
       setProfiles(items)
       setProfile(items[0]?.id || '')
       setProfileError(data.profileError || '')
+      setLayouts(data.layouts || {})
     }).catch(error => setProfileError(String(error)))
     void api('/api/history').then(data => setHistory((data.history || []).map((url: string) => `${API_BASE}${url}`))).catch(() => undefined)
   }, [])
@@ -96,6 +118,7 @@ export default function App() {
       const data = await api('/api/render-storyboard', {
         storyboard: parseDraft(), rendererProfile: profile, steps: steps ? Number(steps) : null,
         guidance: guidance ? Number(guidance) : null, negativePrompt, seed: seed ? Number(seed) : null,
+        publicationFormat: 'paged_comic', layoutMode, pageLayouts: layoutMode === 'manual' ? resolvedPageLayouts() : {}, imageFit,
       })
       const urls = data.pages.map((url: string) => `${API_BASE}${url}`)
       setPages(urls); setHistory(previous => [...urls, ...previous.filter(item => !urls.includes(item))])
@@ -118,6 +141,7 @@ export default function App() {
         pageUrl: editing.pageUrl, panelId: editing.panel.id, panelPrompt, dialogues: parsedDialogues, mode: editMode,
         rendererProfile: profile, steps: steps ? Number(steps) : null, guidance: guidance ? Number(guidance) : null,
         negativePrompt, seed: seed ? Number(seed) : null,
+        publicationFormat: 'paged_comic', layoutMode, pageLayouts: layoutMode === 'manual' ? resolvedPageLayouts() : {}, imageFit,
       })
       const fresh = `${API_BASE}${data.url}?v=${Date.now()}`
       setPages(previous => previous.map(url => url.split('?')[0] === `${API_BASE}${editing.pageUrl}` ? fresh : url))
@@ -138,6 +162,7 @@ export default function App() {
         <div className="flex gap-2"><button disabled={loading || !idea.trim()} onClick={() => void createStoryboard()} className="rounded bg-gray-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"><Pencil className="mr-2 inline h-4 w-4" />Create storyboard</button>{storyboardLoading && <button onClick={cancelStoryboard} className="rounded border border-gray-400 px-4 py-2 text-sm font-medium">Cancel</button>}</div>
         <label className="block pt-3 text-sm font-medium">Approved storyboard JSON</label>
         <textarea value={draft} onChange={event => setDraft(event.target.value)} className="h-[28rem] w-full rounded border p-3 font-mono text-xs" placeholder="The reviewed storyboard appears here before any images are generated." />
+        <div className="space-y-2 rounded border bg-gray-50 p-3 text-sm"><div className="font-medium">Publication format: Paged Comic</div><div className="grid gap-2 sm:grid-cols-2"><label>Layout selection<select value={layoutMode} onChange={event => setLayoutMode(event.target.value as LayoutMode)} className="mt-1 w-full rounded border p-2"><option value="auto">Auto</option><option value="simple">Simple</option><option value="manual">Manual</option></select></label><label>Image fit<select value={imageFit} onChange={event => setImageFit(event.target.value as 'cover' | 'contain')} className="mt-1 w-full rounded border p-2"><option value="cover">Cover / crop</option><option value="contain">Contain / preserve image</option></select></label></div>{layoutMode === 'manual' && storyboardPages.map(page => { const options = layouts[String(page.count)] || []; const value = pageLayouts[String(page.number)] || options[0] || ''; return <label key={page.number} className="block">Page {page.number} ({page.count} panels)<select value={value} onChange={event => setPageLayouts(previous => ({ ...previous, [String(page.number)]: event.target.value }))} className="mt-1 w-full rounded border p-2"><option value="">Select compatible layout</option>{options.map(layout => <option key={layout} value={layout}>{layout.replace(/^paged_/, '').replaceAll('_', ' ')}</option>)}</select></label> })}</div>
       </section>
       <section className="space-y-4 rounded-lg border bg-white p-5 shadow-sm">
         <h2 className="font-semibold">ComfyUI renderer</h2>

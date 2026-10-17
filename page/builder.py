@@ -16,21 +16,38 @@ def load_panels(panels_dir: str, expected_panel_ids: Optional[List[str]] = None)
     
     if expected_panel_ids:
         panel_files = []
+        missing_panel_ids = []
         for pid in expected_panel_ids:
             pfile = panel_path / f"{pid}.png"
             if pfile.exists():
                 panel_files.append(pfile)
+            else:
+                missing_panel_ids.append(pid)
+        if missing_panel_ids:
+            raise ValueError(
+                "Cannot compose page: missing expected panel image(s): "
+                + ", ".join(missing_panel_ids)
+            )
     else:
         panel_files = sorted(panel_path.glob("panel_*.png"))
         if not panel_files:
             panel_files = sorted(panel_path.glob("*.png"))
     
+    unreadable_panels = []
     for panel_file in panel_files:
         panel_id = panel_file.stem
         try:
             panels[panel_id] = Image.open(panel_file).convert("RGB")
         except Exception as e:
-            print(f"[WARN] Could not load panel {panel_file}: {e}")
+            if expected_panel_ids:
+                unreadable_panels.append(f"{panel_id} ({e})")
+            else:
+                print(f"[WARN] Could not load panel {panel_file}: {e}")
+    if unreadable_panels:
+        raise ValueError(
+            "Cannot compose page: unreadable expected panel image(s): "
+            + ", ".join(unreadable_panels)
+        )
     
     return panels
 
@@ -97,7 +114,7 @@ def preserve_aspect_resize(
         paste_y = (target_height - new_height) // 2
         blurred_bg.paste(resized, (paste_x, paste_y))
         return blurred_bg
-    else:
+    elif fill_mode in {"contain", "pad"}:
         if original_aspect > target_aspect:
             new_width = target_width
             new_height = int(target_width / original_aspect)
@@ -115,6 +132,7 @@ def preserve_aspect_resize(
             return result
         
         return resized
+    raise ValueError(f"Unknown image fit mode '{fill_mode}'.")
 
 def build_comic_page_with_grid(
     panels: List[Image.Image],
@@ -123,13 +141,14 @@ def build_comic_page_with_grid(
     page_height: int = None,
     margin: int = None,
     gutter: int = None,
+    image_fit: str = "cover",
 ) -> Tuple[Image.Image, List[Tuple[int, int, int, int]]]:
     page_width = page_width or CONFIG.page.width
     page_height = page_height or CONFIG.page.height
     margin = margin or CONFIG.page.margin
     gutter = gutter or CONFIG.page.gutter
     if layout_name not in LAYOUT_SETTINGS:
-        layout_name = "Layout1"
+        layout_name = select_layout_name(len(panels))
 
     placements = compute_layout_placements(
         layout_name,
@@ -158,7 +177,7 @@ def build_comic_page_with_grid(
             panel_img,
             panel_width,
             panel_height,
-            fill_mode="crop",
+            fill_mode="crop" if image_fit == "cover" else "contain",
             important_region=important_region,
         )
 
@@ -179,7 +198,9 @@ def build_comic_page(
     schema_path: Optional[str] = None,
     inject_bubbles: bool = True,
     use_adaptive_layout: bool = True,
-    layout_name: str = "Layout1",
+    layout_name: Optional[str] = None,
+    image_fit: str = "cover",
+    layout_metadata_path: Optional[str] = None,
 ) -> Image.Image:
     panels_dict = load_panels(panels_dir, expected_panel_ids=expected_panel_ids)
     
@@ -189,7 +210,10 @@ def build_comic_page(
     num_panels = len(panels_dict)
     print(f"[INFO] Found {num_panels} panels")
     
-    panel_list = get_panel_list_ordered(panels_dict)
+    panel_list = (
+        [panels_dict[panel_id] for panel_id in expected_panel_ids if panel_id in panels_dict]
+        if expected_panel_ids else get_panel_list_ordered(panels_dict)
+    )
     
     if use_adaptive_layout:
         if layout_name not in LAYOUT_SETTINGS:
@@ -198,6 +222,7 @@ def build_comic_page(
         page, panel_positions = build_comic_page_with_grid(
             panel_list,
             layout_name=layout_name,
+            image_fit=image_fit,
         )
     else:
         page_width = CONFIG.page.width
@@ -209,7 +234,7 @@ def build_comic_page(
         panel_positions = []
         
         if num_panels == 1:
-            resized = preserve_aspect_resize(panel_list[0], page_width - margin * 2, page_height - margin * 2)
+            resized = preserve_aspect_resize(panel_list[0], page_width - margin * 2, page_height - margin * 2, fill_mode="crop" if image_fit == "cover" else "contain")
             x = margin
             y = margin
             page.paste(resized, (x, y))
@@ -219,7 +244,7 @@ def build_comic_page(
             panel_width = page_width - margin * 2
             
             for i, panel_img in enumerate(panel_list):
-                resized = preserve_aspect_resize(panel_img, panel_width, panel_height)
+                resized = preserve_aspect_resize(panel_img, panel_width, panel_height, fill_mode="crop" if image_fit == "cover" else "contain")
                 y = margin + i * (panel_height + gutter)
                 x = margin + (panel_width - resized.width) // 2
                 page.paste(resized, (x, y))
@@ -229,7 +254,7 @@ def build_comic_page(
             top_width = page_width - margin * 2
             
             for i, panel_img in enumerate(panel_list):
-                resized = preserve_aspect_resize(panel_img, top_width, top_height)
+                resized = preserve_aspect_resize(panel_img, top_width, top_height, fill_mode="crop" if image_fit == "cover" else "contain")
                 y = margin + i * (top_height + gutter)
                 x = margin + (top_width - resized.width) // 2
                 page.paste(resized, (x, y))
@@ -239,7 +264,7 @@ def build_comic_page(
             panel_width = page_width - margin * 2
             
             for i, panel_img in enumerate(panel_list[:4]):
-                resized = preserve_aspect_resize(panel_img, panel_width, panel_height)
+                resized = preserve_aspect_resize(panel_img, panel_width, panel_height, fill_mode="crop" if image_fit == "cover" else "contain")
                 y = margin + i * (panel_height + gutter)
                 x = margin + (panel_width - resized.width) // 2
                 page.paste(resized, (x, y))
@@ -265,13 +290,15 @@ def build_comic_page(
     # Save panel positions
     if schema_path:
         layout_filename = Path(schema_path).name.replace('story', 'page_layout')
-        pos_path = Path(schema_path).parent / layout_filename
+        pos_path = Path(layout_metadata_path) if layout_metadata_path else Path(schema_path).parent / layout_filename
         import json
         with open(pos_path, "w", encoding="utf-8") as f:
             json.dump({
                 "page_width": page.width,
                 "page_height": page.height,
-                "panels": panel_positions
+                "panels": panel_positions,
+                "layout_name": layout_name,
+                "image_fit": image_fit,
             }, f)
     
     return page

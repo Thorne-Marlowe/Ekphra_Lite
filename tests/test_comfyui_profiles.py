@@ -14,10 +14,12 @@ class RendererProfileTests(unittest.TestCase):
 
         workflow = profile.load_workflow(root)
         original_prompt = workflow["148"]["inputs"]["text"]
-        bound = profile.apply_inputs(workflow, {"positive_prompt": "a comic panel test prompt"})
+        bound = profile.apply_inputs(workflow, {"positive_prompt": "a comic panel test prompt", "width": 832, "height": 1216})
 
         self.assertEqual(profile.output_node_id, "9")
         self.assertEqual(bound["148"]["inputs"]["text"], "a comic panel test prompt")
+        self.assertEqual(bound["150"]["inputs"]["value"], 832)
+        self.assertEqual(bound["151"]["inputs"]["value"], 1216)
         self.assertEqual(workflow["148"]["inputs"]["text"], original_prompt)
         self.assertEqual(bound["9"]["class_type"], "SaveImage")
         self.assertEqual(bound["144"]["inputs"]["unet_name"], workflow["144"]["inputs"]["unet_name"])

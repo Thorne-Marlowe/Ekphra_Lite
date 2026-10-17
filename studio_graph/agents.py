@@ -19,7 +19,7 @@ from .structured_output import (
     STORY_PLAN_SCHEMA,
     create_structured_llm,
 )
-from .validation import validate_storyboard_structure
+from .validation import normalize_single_frame_actions, validate_storyboard_structure
 import os
 import base64
 import logging
@@ -512,6 +512,11 @@ def run_storyboarder(state: StudioState) -> StudioState:
         schema = parse_json_content(res.content)
         _apply_story_constraints(schema, state.get("story_plan", {}))
         _normalize_panel_schema(schema)
+        temporal_errors = normalize_single_frame_actions(schema)
+        if temporal_errors:
+            state["current_schema"] = schema
+            state["validation_errors"] = temporal_errors
+            return state
         # Character cards are immutable across validator/Vision retries.  A
         # fresh storyboard draft must not silently replace the registered cast.
         previous_characters = state.get("current_schema", {}).get("characters", {})
@@ -536,23 +541,6 @@ def run_storyboarder(state: StudioState) -> StudioState:
                 # Do not inspect prose for story-specific keywords here. The
                 # structured cast/subject fields and Art Director are the
                 # source of truth; arbitrary prompt wording must remain free.
-        # Deterministically synchronize the visual brief with the approved
-        # dialogue. This avoids needless Art Director retries when the model
-        # wrote a valid line but forgot a speech/expression cue.
-        for page in schema.get("pages", []):
-            for panel in page.get("panels", []):
-                dialogues = panel.get("dialogues", []) or []
-                if not dialogues:
-                    continue
-                visual = str(panel.get("panel_prompt_en", "")).strip().rstrip(".,")
-                lower_visual = visual.lower()
-                if "speaking" not in lower_visual and "talking" not in lower_visual:
-                    visual += ", speaking, open mouth"
-                emotions = [str(item.get("emotion", "")).strip().lower() for item in dialogues]
-                for emotion in emotions:
-                    if emotion and emotion not in lower_visual:
-                        visual += f", {emotion} expression"
-                panel["panel_prompt_en"] = visual
         if structural_errors:
             state["validation_errors"] = structural_errors
             return state
@@ -566,16 +554,6 @@ def run_storyboarder(state: StudioState) -> StudioState:
         state["normalization_notes"] = normalization_notes
         for note in normalization_notes:
             logger.info("Storyboard accepted with safe normalization: %s", note)
-        # The renderer operates on each panel independently. Repeat the fixed
-        # cast and the one setting in every visual brief so an SD image cannot
-        # drift into an unrelated portrait or room on later panels.
-        cast = schema.get("characters", {})
-        for page in schema.get("pages", []):
-            for panel in page.get("panels", []):
-                panel["panel_prompt_en"] = (
-                    "preserve the registered recurring cast and approved setting; "
-                    f"{panel.get('panel_prompt_en', '')}"
-                )
         state["current_schema"] = schema
         state["validation_errors"] = []
     except Exception as e:

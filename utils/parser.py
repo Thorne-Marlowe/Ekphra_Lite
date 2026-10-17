@@ -73,8 +73,8 @@ class Character:
     description: str
     base_prompt_en: str
     base_negative_en: str = ""
-    camera_angle: str = "close-up"
-    camera_distance: str = "close"
+    camera_angle: str = ""
+    camera_distance: str = ""
     seed: int = 0
 
 @dataclass
@@ -152,8 +152,8 @@ def load_comic_from_json(data: dict) -> Comic:
             description=ch_data.get("description", ""),
             base_prompt_en=ch_data.get("base_prompt_en", ""),
             base_negative_en=ch_data.get("base_negative_en", ""),
-            camera_angle=ch_data.get("camera_angle", "close-up"),
-            camera_distance=ch_data.get("camera_distance", "close"),
+            camera_angle=ch_data.get("camera_angle", ""),
+            camera_distance=ch_data.get("camera_distance", ""),
             seed=ch_data.get("seed", 0),
         )
     

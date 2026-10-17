@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from pathlib import Path
+from typing import Literal
 
 import uvicorn
 from dotenv import load_dotenv
@@ -16,6 +18,7 @@ from comfyui.client import ComfyUIClient, ComfyUIError
 from comfyui.profiles import ProfileError, RendererProfileStore
 from config import CONFIG
 from panel_engine.comfy_renderer import render_comic_schema
+from page.layouts import compatible_layout_names
 from studio_graph.graph import create_storyboard_graph
 from utils.parser import load_comic_from_json
 
@@ -49,6 +52,10 @@ class RenderRequest(BaseModel):
     negativePrompt: str = ""
     seed: int | None = Field(default=None, ge=0)
     jobId: str | None = Field(default=None, max_length=100)
+    publicationFormat: Literal["paged_comic"] = "paged_comic"
+    layoutMode: Literal["auto", "simple", "manual"] = "auto"
+    pageLayouts: dict[str, str] = Field(default_factory=dict)
+    imageFit: Literal["cover", "contain"] = "cover"
 
 
 class RegeneratePanelRequest(RenderRequest):
@@ -106,9 +113,15 @@ async def get_capabilities():
             "renderer": "comfyui",
             "profiles": [{"id": item.id, "label": item.label, "description": item.description} for item in profiles.values()],
             "visionQaEnabled": CONFIG.vision.enabled,
+            "publicationFormats": ["paged_comic"],
+            "layouts": {str(count): compatible_layout_names(count) for count in range(1, 7)},
         }
     except ProfileError as exc:
-        return {"renderer": "comfyui", "profiles": [], "profileError": str(exc), "visionQaEnabled": CONFIG.vision.enabled}
+        return {
+            "renderer": "comfyui", "profiles": [], "profileError": str(exc), "visionQaEnabled": CONFIG.vision.enabled,
+            "publicationFormats": ["paged_comic"],
+            "layouts": {str(count): compatible_layout_names(count) for count in range(1, 7)},
+        }
 
 
 async def invoke_storyboard_graph(state: dict, request: Request) -> dict:
@@ -170,7 +183,11 @@ async def render_storyboard(req: RenderRequest):
     profile = profile_or_422(req.rendererProfile)
     job_id = req.jobId or uuid.uuid4().hex
     try:
-        pages, _ = render_comic_schema(req.storyboard, job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout)
+        pages, _ = render_comic_schema(
+            req.storyboard, job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout,
+            publication_format=req.publicationFormat, layout_mode=req.layoutMode,
+            page_layouts=req.pageLayouts, image_fit=req.imageFit,
+        )
     except (ComfyUIError, ProfileError, ValueError, RuntimeError, OSError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"jobId": job_id, "pages": ["/outputs/" + Path(path).relative_to(output_dir).as_posix() for path in pages]}
@@ -188,7 +205,10 @@ async def get_page_meta(url: str = Query(..., min_length=1)):
     job_dir = output_dir / "jobs" / job_id
     try:
         schema = json.loads((job_dir / "story.json").read_text(encoding="utf-8"))
-        layout = json.loads((job_dir / "page_layout.json").read_text(encoding="utf-8"))
+        layout_path = job_dir / f"page_layout_{page_number}.json"
+        if not layout_path.exists():
+            layout_path = job_dir / "page_layout.json"  # Existing rendered jobs.
+        layout = json.loads(layout_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=404, detail=f"Page metadata not found: {exc}") from exc
     panels = next((page.get("panels", []) for page in schema.get("pages", []) if int(page.get("page_number", 1)) == page_number), [])
@@ -200,27 +220,119 @@ async def get_page_meta(url: str = Query(..., min_length=1)):
 
 @app.post("/api/regenerate-panel")
 async def regenerate_panel(req: RegeneratePanelRequest):
-    page_path, job_id, _ = page_job_info(req.pageUrl)
-    schema_path = output_dir / "jobs" / job_id / "story.json"
+    page_path, job_id, requested_page_number = page_job_info(req.pageUrl)
+    job_dir = output_dir / "jobs" / job_id
+    schema_path = job_dir / "story.json"
     if not schema_path.exists():
         raise HTTPException(status_code=404, detail="Generation job not found")
+    # Keep the approved job untouched until the renderer has produced a valid
+    # replacement page in an isolated staging job.
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    updated_schema = json.loads(json.dumps(schema))
     found = False
-    for page in schema.get("pages", []):
+    affected_page_number = requested_page_number
+    for page in updated_schema.get("pages", []):
         for panel in page.get("panels", []):
             if panel.get("id") == req.panelId:
                 panel["panel_prompt_en"] = req.panelPrompt
                 panel["dialogues"] = req.dialogues
                 found = True
+                affected_page_number = int(page.get("page_number", requested_page_number))
     if not found:
         raise HTTPException(status_code=404, detail="Panel not found")
     profile = profile_or_422(req.rendererProfile)
+    layout_mode = req.layoutMode
+    page_layouts = req.pageLayouts
+    image_fit = req.imageFit
+    # Reuse the original page geometry for legacy editor requests that do not
+    # explicitly make a new layout choice.
+    stored_layout_path = output_dir / "jobs" / job_id / "layout_config.json"
+    if layout_mode == "auto" and not page_layouts and stored_layout_path.exists():
+        try:
+            stored_layout = json.loads(stored_layout_path.read_text(encoding="utf-8"))
+            page_layouts = stored_layout.get("page_layouts", {})
+            layout_mode = "manual"
+            page_image_fits = stored_layout.get("page_image_fits", {})
+            image_fit = page_image_fits.get(str(affected_page_number), stored_layout.get("image_fit", image_fit))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    staging_job_id = f"{job_id}_staging_{uuid.uuid4().hex}"
+    staging_dir = output_dir / "jobs" / staging_job_id
+    staged_pages: list[Path] = []
     try:
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        source_panels = job_dir / "panels"
+        if source_panels.exists():
+            shutil.copytree(source_panels, staging_dir / "panels")
+        else:
+            (staging_dir / "panels").mkdir()
         # An empty target set means compositor-only dialogue editing.
         targets = [] if req.mode == "dialogue" else [req.panelId]
-        render_comic_schema(schema, job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout, targets)
+        pages, _ = render_comic_schema(
+            updated_schema, staging_job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout, targets,
+            publication_format=req.publicationFormat, layout_mode=layout_mode,
+            page_layouts=page_layouts, image_fit=image_fit, compose_page_numbers=[affected_page_number],
+        )
+        staged_pages = [Path(item) for item in pages]
+        if len(staged_pages) != 1 or not staged_pages[0].is_file():
+            raise RuntimeError(
+                f"Expected one completed recomposed page, received {len(staged_pages)}."
+            )
+        staged_story_path = staging_dir / "story.json"
+        staged_sizes_path = staging_dir / "panel_sizes.json"
+        staged_page_layout_path = staging_dir / f"page_layout_{affected_page_number}.json"
+        staged_layout_path = staging_dir / "layout_config.json"
+        if req.mode != "dialogue" and not (staging_dir / "panels" / f"{req.panelId}.png").is_file():
+            raise RuntimeError(f"Regenerated panel image was not produced for {req.panelId}.")
+        # Read all staged metadata before changing the approved job.  This
+        # catches an incomplete renderer result as a clean rollback.
+        json.loads(staged_story_path.read_text(encoding="utf-8"))
+        staged_sizes = json.loads(staged_sizes_path.read_text(encoding="utf-8"))
+        json.loads(staged_page_layout_path.read_text(encoding="utf-8"))
+        staged_layout = json.loads(staged_layout_path.read_text(encoding="utf-8"))
+
+        # Commit only the changed page and its panel/story metadata after the
+        # staged composition has completed successfully.
+        if req.mode != "dialogue":
+            source = staging_dir / "panels" / f"{req.panelId}.png"
+            destination = job_dir / "panels" / source.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        shutil.copy2(staged_story_path, schema_path)
+
+        affected_ids = {
+            panel.get("id") for page in updated_schema.get("pages", [])
+            if int(page.get("page_number", 1)) == affected_page_number
+            for panel in page.get("panels", [])
+        }
+        existing_sizes_path = job_dir / "panel_sizes.json"
+        existing_sizes = json.loads(existing_sizes_path.read_text(encoding="utf-8")) if existing_sizes_path.exists() else {}
+        existing_sizes.update({panel_id: staged_sizes[panel_id] for panel_id in affected_ids if panel_id in staged_sizes})
+        existing_sizes_path.write_text(json.dumps(existing_sizes, indent=2), encoding="utf-8")
+
+        shutil.copy2(staged_page_layout_path, job_dir / f"page_layout_{affected_page_number}.json")
+        existing_layout_path = job_dir / "layout_config.json"
+        existing_layout = json.loads(existing_layout_path.read_text(encoding="utf-8")) if existing_layout_path.exists() else {}
+        existing_layout.setdefault("page_layouts", {}).update({
+            str(affected_page_number): staged_layout["page_layouts"][str(affected_page_number)]
+        })
+        existing_layout.setdefault("page_image_fits", {}).update({
+            str(affected_page_number): staged_layout.get("page_image_fits", {}).get(str(affected_page_number), image_fit)
+        })
+        existing_layout.setdefault("publication_format", staged_layout.get("publication_format", req.publicationFormat))
+        existing_layout.setdefault("layout_mode", staged_layout.get("layout_mode", layout_mode))
+        existing_layout.setdefault("image_fit", staged_layout.get("image_fit", image_fit))
+        existing_layout_path.write_text(json.dumps(existing_layout, indent=2), encoding="utf-8")
+
+        shutil.copy2(staged_pages[0], page_path)
     except (ComfyUIError, ProfileError, ValueError, RuntimeError, OSError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        for staged_page in staged_pages:
+            if staged_page.parent.resolve() == output_dir.resolve() and staged_page.name.startswith(f"comic_page_{staging_job_id}_"):
+                staged_page.unlink(missing_ok=True)
     return {"url": "/outputs/" + page_path.relative_to(output_dir.resolve()).as_posix(), "panelId": req.panelId, "mode": req.mode}
 
 

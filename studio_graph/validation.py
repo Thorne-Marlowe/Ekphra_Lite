@@ -1,7 +1,65 @@
 """Deterministic storyboard checks used before a draft reaches the user."""
 from __future__ import annotations
 
+import re
 from typing import Any
+
+
+_PAUSE_THEN_ACTION = re.compile(
+    r"^(?P<subject>.+?)\s+(?P<hold>pauses|holds|remains|stands|stays)(?P<detail>[^,;]*),\s*(?:and\s+)?then\s+(?P<next>.+)$",
+    re.IGNORECASE,
+)
+_SEQUENCE_CONNECTOR = re.compile(
+    r"(?:,\s*(?:and\s+)?then\b|\bafter\s+(?:he|she|they|[A-Za-z]+ing)\b)",
+    re.IGNORECASE,
+)
+_GERUNDS = {
+    "looks": "looking", "turns": "turning", "reaches": "reaching", "leans": "leaning",
+    "stares": "staring", "glances": "glancing", "raises": "raising", "lowers": "lowering",
+}
+
+
+def normalize_single_frame_actions(schema: Any) -> list[str]:
+    """Safely collapse only an unambiguous hold-then-action into one still.
+
+    Other sequential wording is retained and returned as a deterministic
+    validation issue so the storyboard artist, rather than code, can choose
+    the intended single visual moment.
+    """
+    if not isinstance(schema, dict):
+        return []
+    errors: list[str] = []
+    for page_index, page in enumerate(schema.get("pages", []), start=1):
+        if not isinstance(page, dict):
+            continue
+        for panel_index, panel in enumerate(page.get("panels", []), start=1):
+            if not isinstance(panel, dict):
+                continue
+            action = str(panel.get("required_action", "")).strip()
+            if _SEQUENCE_CONNECTOR.search(action):
+                match = _PAUSE_THEN_ACTION.match(action)
+                if match:
+                    next_action = match.group("next").strip()
+                    words = next_action.split(maxsplit=1)
+                    if words and words[0].casefold() in _GERUNDS:
+                        next_action = _GERUNDS[words[0].casefold()] + (f" {words[1]}" if len(words) > 1 else "")
+                        panel["required_action"] = (
+                            f"{match.group('subject')} {match.group('hold')}{match.group('detail')} while {next_action}"
+                        )
+                    else:
+                        errors.append(
+                            f"Page {page_index}, panel {panel_index} required_action describes a sequence; use one drawable instant."
+                        )
+                else:
+                    errors.append(
+                        f"Page {page_index}, panel {panel_index} required_action describes a sequence; use one drawable instant."
+                    )
+            panel_prompt = str(panel.get("panel_prompt_en", "")).strip()
+            if _SEQUENCE_CONNECTOR.search(panel_prompt):
+                errors.append(
+                    f"Page {page_index}, panel {panel_index} panel_prompt_en describes a sequence; use one drawable instant."
+                )
+    return errors
 
 
 def validate_storyboard_structure(schema: Any, requested_pages: int) -> list[str]:

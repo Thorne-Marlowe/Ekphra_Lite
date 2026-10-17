@@ -413,6 +413,37 @@ def _rects_overlap(
     )
 
 
+def normalize_lettering_text(value: object) -> str:
+    """Normalize authored lettering solely for duplicate detection."""
+    text = " ".join(str(value).split()).casefold()
+    quote_pairs = {"'": "'", '"': '"', "“": "”", "‘": "’", "`": "`"}
+    while len(text) >= 2 and text[0] in quote_pairs and text[-1] == quote_pairs[text[0]]:
+        text = text[1:-1].strip()
+    return text
+
+
+def caption_texts_for_panel(panel_data: dict) -> List[str]:
+    """Return authored captions that are not duplicate spoken dialogue."""
+    spoken = {
+        normalized
+        for dialogue in panel_data.get("dialogues", []) or []
+        if isinstance(dialogue, dict)
+        if (normalized := normalize_lettering_text(dialogue.get("text", "")))
+    }
+    captions: List[str] = []
+    for item in panel_data.get("required_text", []) or []:
+        text = str(item).strip()
+        normalized = normalize_lettering_text(text)
+        if normalized and normalized not in spoken:
+            captions.append(text)
+    return captions
+
+
+def panel_font_size(panel_width: int, panel_height: int) -> int:
+    """Use one readable lettering scale for all text types in a panel."""
+    return max(22, min(72, int(min(panel_width, panel_height) * 0.055)))
+
+
 def _place_bubble_without_overlap(
     preferred: Tuple[int, int],
     width: int,
@@ -430,11 +461,17 @@ def _place_bubble_without_overlap(
     """
     panel_x, panel_y, panel_w, panel_h = panel_bounds
     padding = max(20, min(48, int(min(panel_w, panel_h) * 0.02)))
-    max_x = panel_x + max(padding, panel_w - width - padding)
-    max_y = panel_y + max(padding, panel_h - height - padding)
+    if width + padding * 2 > panel_w or height + padding * 2 > panel_h:
+        raise ValueError("Lettering does not fit within panel bounds.")
+    max_x = panel_x + panel_w - width - padding
+    max_y = panel_y + panel_h - height - padding
 
     def valid(x: int, y: int) -> bool:
         rect = (x, y, width, height)
+        if x < panel_x + padding or y < panel_y + padding:
+            return False
+        if x + width > panel_x + panel_w - padding or y + height > panel_y + panel_h - padding:
+            return False
         if any(_rects_overlap(rect, item) for item in existing):
             return False
         if character_bbox and _rects_overlap(rect, character_bbox, margin=4):
@@ -455,14 +492,7 @@ def _place_bubble_without_overlap(
             if valid(x, y):
                 return x, y
 
-    # If the panel is genuinely full, place below the last local bubble while
-    # clamping to the panel. This may touch the character but never overlaps a
-    # previous bubble's rectangle.
-    if existing:
-        last = max(existing, key=lambda item: item[1] + item[3])
-        fallback_y = min(max_y, last[1] + last[3] + padding)
-        return max(panel_x + padding, min(px, max_x)), fallback_y
-    return px, py
+    raise ValueError("No non-overlapping lettering position is available in this panel.")
 
 
 def sample_bubble_position(
@@ -1178,7 +1208,9 @@ def inject_bubbles_to_page(
     # panel images are drawn.  This is derived only from the schema, so it
     # works for labels, signs, screens, or any other authored text without
     # hard-coding a story-specific object.
-    panel_bubbles_drawn: Dict[int, List[Tuple[int, int, int, int]]] = {}
+    # Captions and speech bubbles share one panel-local occupancy list.  Their
+    # visual forms differ, but neither may overwrite the other.
+    panel_lettering: Dict[int, List[Tuple[int, int, int, int]]] = {}
     for panel_data in panels_data:
         panel_id = panel_data.get("id")
         if not panel_id or (expected_panel_ids and panel_id not in expected_panel_ids):
@@ -1187,12 +1219,9 @@ def inject_bubbles_to_page(
         if i >= len(panel_positions):
             continue
         panel_x, panel_y, panel_w, panel_h = panel_positions[i]
-        local_existing = panel_bubbles_drawn.setdefault(i, [])
-        for text_item in panel_data.get("required_text", []) or []:
-            text = str(text_item).strip()
-            if not text:
-                continue
-            font_size = max(26, int(panel_h * 0.055))
+        local_existing = panel_lettering.setdefault(i, [])
+        for text in caption_texts_for_panel(panel_data):
+            font_size = panel_font_size(panel_w, panel_h)
             font = load_font("actionman", font_size)
             max_width = int(panel_w * 0.72)
             text_lines = wrap_text_to_lines(text, font, max_width)
@@ -1209,16 +1238,10 @@ def inject_bubbles_to_page(
             # for a caption-only silent panel.
             x = max(panel_x + 12, min(panel_x + (panel_w - box_w) // 2, panel_x + panel_w - box_w - 12))
             y = panel_y + max(12, int(panel_h * 0.08))
-            candidate = (int(x), int(y), box_w, box_h)
-            for _ in range(12):
-                if not any(_rects_overlap(candidate, other, margin=8) for other in local_existing):
-                    break
-                y += box_h + 10
-                if y + box_h > panel_y + panel_h - 12:
-                    y = panel_y + 12
-                    x = panel_x + 12
-                candidate = (int(x), int(y), box_w, box_h)
-            x, y = candidate[:2]
+            x, y = _place_bubble_without_overlap(
+                (int(x), int(y)), box_w, box_h,
+                (panel_x, panel_y, panel_w, panel_h), local_existing, None,
+            )
             caption_bbox = (int(x), int(y), box_w, box_h)
             local_existing.append(caption_bbox)
             draw.rounded_rectangle(
@@ -1238,8 +1261,6 @@ def inject_bubbles_to_page(
 
     # Keep occupancy local to each panel. Page coordinates are used for drawing,
     # but a bubble in panel 1 must not make panel 2 appear occupied.
-    panel_bubbles: Dict[int, List[Tuple[int, int, int, int]]] = {}
-
     for entry, bubble_panel in zip(bubble_entries, bubble_panels):
         text = entry["text"]
         emotion = entry.get("emotion")
@@ -1248,9 +1269,9 @@ def inject_bubbles_to_page(
         panel_y = bubble_panel["panel_y"]
         panel_w = bubble_panel["panel_w"]
         panel_h = bubble_panel["panel_h"]
-        local_existing = panel_bubbles.setdefault(bubble_panel["panel_idx"], [])
+        local_existing = panel_lettering.setdefault(bubble_panel["panel_idx"], [])
 
-        font_size = max(22, min(page_width, page_height) // 36)
+        font_size = panel_font_size(panel_w, panel_h)
         font_name = get_font_name_for_emotion(emotion)
         font = load_font(font_name, font_size)
 

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Image as ImageIcon, Pencil, RotateCcw, Save } from 'lucide-react'
 import { StoryboardRequestController } from './storyboardRequest'
+import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from './visionQa'
 
 type Dialogue = { character_id?: string; text?: string; emotion?: string }
 type PanelMeta = { id: string; x: number; y: number; width: number; height: number; prompt: string; dialogues: Dialogue[] }
@@ -8,6 +9,10 @@ type PageMeta = { url: string; pageWidth: number; pageHeight: number; panels: Pa
 type Profile = { id: string; label: string; description: string }
 type LayoutMode = 'auto' | 'simple' | 'manual'
 type StoryboardPage = { number: number; count: number }
+type VisionQaObservation = { category: string; severity: string; confidence: string; explanation: string }
+type VisionQaAssessment = { panel_id?: string; page_number: number; panel_ids?: string[]; status: 'assessed' | 'error'; observations: VisionQaObservation[]; error?: string }
+type VisionQaReport = { run_id: string; status: 'completed' | 'partial' | 'unavailable'; model?: string | null; started_at: string; completed_at: string; raw_panels: VisionQaAssessment[]; pages: VisionQaAssessment[]; errors: { scope?: string; error?: string }[] }
+type VisionQaSummary = { runId: string; status: VisionQaReport['status']; model?: string | null; startedAt: string; completedAt: string; rawPanelCount: number; pageCount: number; errorCount: number }
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
 
 export default function App() {
@@ -35,6 +40,12 @@ export default function App() {
   const [imageFit, setImageFit] = useState<'cover' | 'contain'>('cover')
   const [layouts, setLayouts] = useState<Record<string, string[]>>({})
   const storyboardRequest = useRef(new StoryboardRequestController())
+  const [visionQaReports, setVisionQaReports] = useState<VisionQaSummary[]>([])
+  const [visionQaReport, setVisionQaReport] = useState<VisionQaReport | null>(null)
+  const [visionQaLoading, setVisionQaLoading] = useState(false)
+  const [visionQaReportLoading, setVisionQaReportLoading] = useState(false)
+  const [visionQaError, setVisionQaError] = useState('')
+  const visionQaRequests = useRef(new VisionQaRequestTracker())
 
   const api = async (path: string, body?: unknown, signal?: AbortSignal) => {
     const response = await fetch(`${API_BASE}${path}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal } : { signal })
@@ -65,6 +76,37 @@ export default function App() {
     const options = layouts[String(page.count)] || []
     return [String(page.number), pageLayouts[String(page.number)] || options[0] || '']
   }).filter(([, layout]: [string, string]) => Boolean(layout)))
+
+  const selectedVisionQaJobId = useMemo(() => pages.length ? jobIdFromCompletedPageUrl(pages[0]) : null, [pages])
+
+  const selectVisionQaReport = async (jobId: string, runId: string) => {
+    const request = visionQaRequests.current.beginDetail(jobId)
+    setVisionQaReportLoading(true); setVisionQaError('')
+    try {
+      const data = await api(`/api/jobs/${encodeURIComponent(jobId)}/vision-qa/${encodeURIComponent(runId)}`) as { report: VisionQaReport }
+      if (visionQaRequests.current.isDetailCurrent(request)) setVisionQaReport(data.report)
+    } catch (error) {
+      if (visionQaRequests.current.isDetailCurrent(request)) setVisionQaError(`Unable to load Vision QA report: ${error}`)
+    } finally {
+      if (visionQaRequests.current.isDetailCurrent(request)) setVisionQaReportLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    visionQaRequests.current.selectComic(selectedVisionQaJobId)
+    setVisionQaReports([]); setVisionQaReport(null); setVisionQaError(''); setVisionQaReportLoading(false)
+    setVisionQaLoading(visionQaRequests.current.isRunActive(selectedVisionQaJobId))
+    if (!selectedVisionQaJobId) return
+    const request = visionQaRequests.current.beginList(selectedVisionQaJobId)
+    void api(`/api/jobs/${encodeURIComponent(selectedVisionQaJobId)}/vision-qa`).then((data: { reports?: VisionQaSummary[] }) => {
+      if (!visionQaRequests.current.isListCurrent(request)) return
+      const reports = Array.isArray(data.reports) ? data.reports : []
+      setVisionQaReports(reports)
+      if (reports[0]) void selectVisionQaReport(selectedVisionQaJobId, reports[0].runId)
+    }).catch(error => {
+      if (visionQaRequests.current.isListCurrent(request)) setVisionQaError(`Unable to load previous Vision QA reports: ${error}`)
+    })
+  }, [selectedVisionQaJobId])
 
   useEffect(() => {
     void api('/api/capabilities').then(data => {
@@ -127,6 +169,35 @@ export default function App() {
     } catch (error) { setMessage(`Render error: ${error}`) } finally { setLoading(false) }
   }
 
+  const runVisionQa = async () => {
+    const jobId = selectedVisionQaJobId
+    if (!jobId || visionQaLoading) return
+    const request = visionQaRequests.current.beginRun(jobId)
+    if (!request) return
+    setVisionQaLoading(true); setVisionQaReportLoading(false); setVisionQaError('')
+    try {
+      const data = await api(`/api/jobs/${encodeURIComponent(jobId)}/vision-qa`, {}) as { report: VisionQaReport }
+      if (!visionQaRequests.current.isRunCurrent(request)) return
+      const report = data.report
+      setVisionQaReport(report)
+      const summary: VisionQaSummary = {
+        runId: report.run_id, status: report.status, model: report.model, startedAt: report.started_at,
+        completedAt: report.completed_at, rawPanelCount: report.raw_panels.length, pageCount: report.pages.length,
+        errorCount: report.errors.length,
+      }
+      setVisionQaReports(previous => [summary, ...previous.filter(item => item.runId !== summary.runId)])
+      setMessage('Vision QA finished. Its observations are optional suggestions; the comic remains published.')
+    } catch (error) {
+      if (visionQaRequests.current.isRunCurrent(request)) {
+        setVisionQaError(`Vision QA request did not complete: ${error}`)
+        setMessage('Vision QA request did not complete. Existing reports and the selected comic are unchanged.')
+      }
+    } finally {
+      visionQaRequests.current.finishRun(request)
+      setVisionQaLoading(visionQaRequests.current.isRunActive(visionQaRequests.current.currentSelectedJobId()))
+    }
+  }
+
   const openEditor = (pageUrl: string, panel: PanelMeta) => {
     setEditing({ pageUrl, panel }); setPanelPrompt(panel.prompt); setDialogues(JSON.stringify(panel.dialogues, null, 2)); setEditMode('panel')
   }
@@ -172,6 +243,23 @@ export default function App() {
         <div className="grid grid-cols-2 gap-3 text-sm"><label>Steps<input value={steps} onChange={event => setSteps(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="Workflow default" /></label><label>Guidance<input value={guidance} onChange={event => setGuidance(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="Workflow default" /></label><label>Seed<input value={seed} onChange={event => setSeed(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="Workflow default" /></label><label>Negative prompt<input value={negativePrompt} onChange={event => setNegativePrompt(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="If profile maps it" /></label></div>
         <button disabled={loading || !draft.trim() || !profile} onClick={() => void render()} className="rounded bg-indigo-700 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"><ImageIcon className="mr-2 inline h-4 w-4" />Render approved storyboard</button>
         <h2 className="pt-4 font-semibold">History</h2><div className="flex gap-2 overflow-x-auto">{history.map(url => <button key={url} onClick={() => { setPages([url]); void loadMeta(new URL(url).pathname) }} className="h-20 w-14 shrink-0 overflow-hidden rounded border"><img className="h-full w-full object-cover" src={url} /></button>)}</div>
+        <div className="space-y-3 rounded border bg-gray-50 p-3 text-sm">
+          <div><span className="font-medium">Vision QA</span> <span className="text-xs text-gray-500">Optional suggestions only; it never approves, changes, or rerenders this comic.</span></div>
+          {selectedVisionQaJobId ? <>
+            <p className="text-xs text-gray-500">Selected completed job: {selectedVisionQaJobId}</p>
+            <button disabled={visionQaLoading} onClick={() => void runVisionQa()} className="rounded border border-indigo-700 px-3 py-2 text-sm font-medium text-indigo-700 disabled:opacity-50">{visionQaLoading ? 'Vision QA running…' : 'Run Vision QA'}</button>
+            {visionQaLoading && <p className="text-xs text-gray-500">This can take several minutes. Leaving this view does not guarantee the local vision model stops.</p>}
+          </> : <p className="text-xs text-gray-500">Select a completed comic page to run or view Vision QA. This page URL does not identify a verified render job.</p>}
+          {visionQaError && <p className="rounded bg-amber-50 p-2 text-xs text-amber-800">{visionQaError}</p>}
+          {visionQaReports.length > 0 && <label className="block text-xs font-medium">Previous reports<select value={visionQaReport?.run_id || ''} disabled={visionQaReportLoading} onChange={event => selectedVisionQaJobId && void selectVisionQaReport(selectedVisionQaJobId, event.target.value)} className="mt-1 w-full rounded border p-2 text-sm"><option value="">Select a report</option>{visionQaReports.map(report => <option key={report.runId} value={report.runId}>{report.completedAt} — {report.status}</option>)}</select></label>}
+          {visionQaReportLoading && <p className="text-xs text-gray-500">Loading report…</p>}
+          {visionQaReport && <div className="space-y-3 rounded border bg-white p-3 text-xs">
+            <div><span className="font-medium">Report: {visionQaReport.status}</span> · {visionQaReport.model || 'configured vision model'} · {visionQaReport.completed_at}</div>
+            {visionQaReport.errors.map((item, index) => <p key={index} className="text-amber-800">{item.scope || 'QA'}: {item.error || 'Unavailable'}</p>)}
+            <div><div className="font-medium">Raw-panel findings</div>{visionQaReport.raw_panels.map(item => <div key={item.panel_id} className="mt-2 rounded border p-2"><div>Panel {item.panel_id} (page {item.page_number}) — {item.status}</div>{item.error && <p className="text-amber-800">{item.error}</p>}{item.observations.map((observation, index) => <p key={index} className="mt-1">{observation.category} · {observation.severity} · {observation.confidence}: {observation.explanation}</p>)}</div>)}</div>
+            <div><div className="font-medium">Composed-page findings</div>{visionQaReport.pages.map(item => <div key={item.page_number} className="mt-2 rounded border p-2"><div>Page {item.page_number} ({item.panel_ids?.join(', ') || 'no panels'}) — {item.status}</div>{item.error && <p className="text-amber-800">{item.error}</p>}{item.observations.map((observation, index) => <p key={index} className="mt-1">{observation.category} · {observation.severity} · {observation.confidence}: {observation.explanation}</p>)}</div>)}</div>
+          </div>}
+        </div>
       </section>
     </div>
     <section className="mx-auto mt-6 max-w-5xl space-y-6">{pages.length ? pages.map((url, index) => {

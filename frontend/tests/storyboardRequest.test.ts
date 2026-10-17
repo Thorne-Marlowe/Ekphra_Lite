@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { StoryboardRequestController } from '../src/storyboardRequest.ts'
+import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from '../src/visionQa.ts'
 
 test('cancellation aborts the active request and invalidates its result', () => {
   const requests = new StoryboardRequestController()
@@ -19,4 +20,65 @@ test('a stale storyboard response cannot replace a newer request', () => {
   assert.equal(first.controller.signal.aborted, true)
   assert.equal(requests.isCurrent(first.id), false)
   assert.equal(requests.isCurrent(second.id), true)
+})
+
+test('vision QA derives only a safe job ID from a completed comic page URL', () => {
+  assert.equal(jobIdFromCompletedPageUrl('http://127.0.0.1:8000/outputs/comic_page_job_alpha_1.png'), 'job_alpha')
+  assert.equal(jobIdFromCompletedPageUrl('http://127.0.0.1:8000/outputs/comic_page_../escape_1.png'), null)
+  assert.equal(jobIdFromCompletedPageUrl('http://127.0.0.1:8000/outputs/other.png'), null)
+})
+
+test('Comic A completing cannot clear Comic B active QA state', () => {
+  const requests = new VisionQaRequestTracker()
+  requests.selectComic('comic_a')
+  const runA = requests.beginRun('comic_a')!
+  requests.selectComic('comic_b')
+  const runB = requests.beginRun('comic_b')!
+
+  assert.equal(requests.isRunCurrent(runA), false)
+  assert.equal(requests.finishRun(runA), true)
+  assert.equal(requests.isRunActive('comic_b'), true)
+  assert.equal(requests.isRunCurrent(runB), true)
+})
+
+test('an older report-list response is stale after a manual QA run starts', () => {
+  const requests = new VisionQaRequestTracker()
+  requests.selectComic('comic_a')
+  const olderList = requests.beginList('comic_a')
+  requests.beginRun('comic_a')
+
+  assert.equal(requests.isListCurrent(olderList), false)
+})
+
+test('an older report-detail response is stale after a newer report selection', () => {
+  const requests = new VisionQaRequestTracker()
+  requests.selectComic('comic_a')
+  const olderDetail = requests.beginDetail('comic_a')
+  const newerDetail = requests.beginDetail('comic_a')
+
+  assert.equal(requests.isDetailCurrent(olderDetail), false)
+  assert.equal(requests.isDetailCurrent(newerDetail), true)
+})
+
+test('duplicate manual QA runs for the same comic are refused', () => {
+  const requests = new VisionQaRequestTracker()
+  requests.selectComic('comic_a')
+  const first = requests.beginRun('comic_a')
+
+  assert.ok(first)
+  assert.equal(requests.beginRun('comic_a'), null)
+  assert.equal(requests.isRunActive('comic_a'), true)
+})
+
+test('switching comics invalidates stale QA findings and report reads', () => {
+  const requests = new VisionQaRequestTracker()
+  requests.selectComic('comic_a')
+  const run = requests.beginRun('comic_a')!
+  const list = requests.beginList('comic_a')
+  const detail = requests.beginDetail('comic_a')
+  requests.selectComic('comic_b')
+
+  assert.equal(requests.isRunCurrent(run), false)
+  assert.equal(requests.isListCurrent(list), false)
+  assert.equal(requests.isDetailCurrent(detail), false)
 })

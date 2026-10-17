@@ -18,6 +18,7 @@ from comfyui.client import ComfyUIClient, ComfyUIError
 from comfyui.profiles import ProfileError, RendererProfileStore
 from config import CONFIG
 from panel_engine.comfy_renderer import render_comic_schema
+from panel_engine.job_status import completed_job_pages
 from page.layouts import compatible_layout_names
 from studio_graph.graph import create_storyboard_graph
 from utils.parser import load_comic_from_json
@@ -195,8 +196,7 @@ async def render_storyboard(req: RenderRequest):
 
 @app.get("/api/history")
 async def get_history():
-    files = sorted(((f.stat().st_mtime, f.name) for f in output_dir.glob("comic_page_*.png")), reverse=True)
-    return {"history": [f"/outputs/{name}" for _, name in files]}
+    return {"history": ["/outputs/" + page.relative_to(output_dir).as_posix() for page in completed_job_pages(output_dir)]}
 
 
 @app.get("/api/page-meta")

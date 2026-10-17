@@ -12,6 +12,7 @@ from PIL import Image
 from comfyui.client import ComfyUIClient
 from comfyui.profiles import RendererProfile
 from config import CONFIG
+from panel_engine.job_status import mark_completed, mark_failed, reserve_new_render_job, set_render_expectations, start_render
 from page.builder import build_comic_page
 from page.layouts import compute_layout_placements, select_layout_name
 from policy.adult_only import validate_diffusion_prompts, validate_metadata_payload
@@ -345,73 +346,93 @@ def render_comic_schema(
     page_layouts: dict[str, str] | None = None,
     image_fit: str = "cover",
     compose_page_numbers: Iterable[int] | None = None,
+    track_job_completion: bool | None = None,
 ) -> tuple[list[str], Path]:
-    if publication_format != "paged_comic":
-        raise ValueError(f"Unsupported publication format '{publication_format}'.")
-    if layout_mode not in {"auto", "simple", "manual"}:
-        raise ValueError("layout_mode must be auto, simple, or manual.")
-    if image_fit not in {"cover", "contain"}:
-        raise ValueError("image_fit must be cover or contain.")
-    # Direct rendering and older saved storyboards bypass generation-time
-    # validation, so enforce the same policy before any panel is submitted.
-    validate_metadata_payload(schema, path="storyboard")
+    if track_job_completion is None:
+        track_job_completion = target_panel_ids is None and compose_page_numbers is None
     out_dir = Path(CONFIG.paths.panel_dir).parent
     job_dir = out_dir / "jobs" / job_id
     panel_dir = job_dir / "panels"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    schema_path = job_dir / "story.json"
-    schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
-    comic = load_comic_from_json(schema)
-    pages: dict[int, list[Panel]] = {}
-    for panel in comic.panels:
-        pages.setdefault(panel.page_number, []).append(panel)
-    if not pages:
-        raise ValueError("Storyboard has no panels to render.")
-
-    requested_layouts = page_layouts or {}
-    resolved_layouts: dict[int, str] = {}
-    sizes: dict[str, dict[str, int]] = {}
-    for page_number, panels in pages.items():
-        requested = requested_layouts.get(str(page_number)) or requested_layouts.get(page_number)  # type: ignore[arg-type]
-        # Preserve the old request fields for API callers that previously used
-        # them, but new callers use page_layouts and layout_mode.
-        legacy = manga_layout.replace("style", "Layout") if layout_style == "manga" else None
-        preferred = requested or legacy
-        if layout_mode == "manual" and not preferred:
-            raise ValueError(f"Page {page_number} needs a manually selected layout.")
-        layout = select_layout_name(len(panels), preferred=preferred, mode=layout_mode)
-        placements = compute_layout_placements(
-            layout, len(panels), CONFIG.page.width, CONFIG.page.height,
-            CONFIG.page.margin, CONFIG.page.gutter,
-        )
-        resolved_layouts[page_number] = layout
-        for placement, panel in zip(placements, panels):
-            sizes[panel.id] = {"width": placement["width"], "height": placement["height"]}
-    (job_dir / "panel_sizes.json").write_text(json.dumps(sizes, indent=2), encoding="utf-8")
-    (job_dir / "layout_config.json").write_text(json.dumps({
-        "publication_format": publication_format,
-        "layout_mode": layout_mode,
-        "page_layouts": {str(page_number): layout for page_number, layout in resolved_layouts.items()},
-        "image_fit": image_fit,
-        "page_image_fits": {str(page_number): image_fit for page_number in resolved_layouts},
-    }, indent=2), encoding="utf-8")
-
-    # Dialogue-only edits keep existing panel PNGs and only recompose bubbles.
-    targets = None if target_panel_ids is None else list(target_panel_ids)
-    if targets is None or targets:
-        render_panels_with_comfyui(schema_path, panel_dir, profile, client, settings, targets)
-    pages_to_compose = None if compose_page_numbers is None else set(compose_page_numbers)
-    output_paths: list[str] = []
-    for page_number, panels in sorted(pages.items()):
-        if pages_to_compose is not None and page_number not in pages_to_compose:
-            continue
-        expected_ids = [panel.id for panel in panels]
-        layout = resolved_layouts[page_number]
-        page_path = out_dir / f"comic_page_{job_id}_{page_number}.png"
-        build_comic_page(
-            panels_dir=str(panel_dir), output_path=str(page_path), expected_panel_ids=expected_ids,
-            schema_path=str(schema_path), inject_bubbles=True, use_adaptive_layout=True, layout_name=layout,
-            image_fit=image_fit, layout_metadata_path=str(job_dir / f"page_layout_{page_number}.json"),
-        )
-        output_paths.append(str(page_path))
-    return output_paths, schema_path
+    if track_job_completion:
+        reserve_new_render_job(job_dir, job_id)
+        start_render(job_dir, job_id, [], [])
+    else:
+        job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if publication_format != "paged_comic":
+            raise ValueError(f"Unsupported publication format '{publication_format}'.")
+        if layout_mode not in {"auto", "simple", "manual"}:
+            raise ValueError("layout_mode must be auto, simple, or manual.")
+        if image_fit not in {"cover", "contain"}:
+            raise ValueError("image_fit must be cover or contain.")
+        # Direct rendering and older saved storyboards bypass generation-time
+        # validation, so enforce the same policy before any panel is submitted.
+        validate_metadata_payload(schema, path="storyboard")
+        schema_path = job_dir / "story.json"
+        schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+        comic = load_comic_from_json(schema)
+        pages: dict[int, list[Panel]] = {}
+        for panel in comic.panels:
+            pages.setdefault(panel.page_number, []).append(panel)
+        if not pages:
+            raise ValueError("Storyboard has no panels to render.")
+        if track_job_completion:
+            set_render_expectations(job_dir, [panel.id for panel in comic.panels], sorted(pages))
+        requested_layouts = page_layouts or {}
+        resolved_layouts: dict[int, str] = {}
+        sizes: dict[str, dict[str, int]] = {}
+        for page_number, panels in pages.items():
+            requested = requested_layouts.get(str(page_number)) or requested_layouts.get(page_number)  # type: ignore[arg-type]
+            # Preserve the old request fields for API callers that previously used
+            # them, but new callers use page_layouts and layout_mode.
+            legacy = manga_layout.replace("style", "Layout") if layout_style == "manga" else None
+            preferred = requested or legacy
+            if layout_mode == "manual" and not preferred:
+                raise ValueError(f"Page {page_number} needs a manually selected layout.")
+            layout = select_layout_name(len(panels), preferred=preferred, mode=layout_mode)
+            placements = compute_layout_placements(
+                layout, len(panels), CONFIG.page.width, CONFIG.page.height,
+                CONFIG.page.margin, CONFIG.page.gutter,
+            )
+            resolved_layouts[page_number] = layout
+            for placement, panel in zip(placements, panels):
+                sizes[panel.id] = {"width": placement["width"], "height": placement["height"]}
+        (job_dir / "panel_sizes.json").write_text(json.dumps(sizes, indent=2), encoding="utf-8")
+        (job_dir / "layout_config.json").write_text(json.dumps({
+            "publication_format": publication_format,
+            "layout_mode": layout_mode,
+            "page_layouts": {str(page_number): layout for page_number, layout in resolved_layouts.items()},
+            "image_fit": image_fit,
+            "page_image_fits": {str(page_number): image_fit for page_number in resolved_layouts},
+        }, indent=2), encoding="utf-8")
+        # Dialogue-only edits keep existing panel PNGs and only recompose bubbles.
+        targets = None if target_panel_ids is None else list(target_panel_ids)
+        if targets is None or targets:
+            render_panels_with_comfyui(schema_path, panel_dir, profile, client, settings, targets)
+        pages_to_compose = None if compose_page_numbers is None else set(compose_page_numbers)
+        output_paths: list[str] = []
+        for page_number, panels in sorted(pages.items()):
+            if pages_to_compose is not None and page_number not in pages_to_compose:
+                continue
+            expected_ids = [panel.id for panel in panels]
+            layout = resolved_layouts[page_number]
+            page_path = out_dir / f"comic_page_{job_id}_{page_number}.png"
+            build_comic_page(
+                panels_dir=str(panel_dir), output_path=str(page_path), expected_panel_ids=expected_ids,
+                schema_path=str(schema_path), inject_bubbles=True, use_adaptive_layout=True, layout_name=layout,
+                image_fit=image_fit, layout_metadata_path=str(job_dir / f"page_layout_{page_number}.json"),
+            )
+            output_paths.append(str(page_path))
+        if track_job_completion:
+            expected_pages = {page_number for page_number in pages}
+            produced_pages = {Path(path).name for path in output_paths}
+            if len(output_paths) != len(expected_pages) or any(
+                f"comic_page_{job_id}_{page_number}.png" not in produced_pages for page_number in expected_pages
+            ):
+                raise RuntimeError("Render did not produce every expected composed page.")
+            mark_completed(job_dir, [Path(path) for path in output_paths])
+        return output_paths, schema_path
+    except Exception as exc:
+        if track_job_completion:
+            mark_failed(job_dir, exc)
+        raise

@@ -14,6 +14,7 @@ from comfyui.profiles import RendererProfile
 from config import CONFIG
 from page.builder import build_comic_page
 from page.layouts import compute_layout_placements, select_layout_name
+from policy.adult_only import validate_diffusion_prompts, validate_metadata_payload
 from utils.parser import Comic, Panel, load_comic_from_json
 
 
@@ -312,7 +313,14 @@ def render_panels_with_comfyui(
         layout_height = int(size.get("height", CONFIG.panel.height))
         width, height = select_panel_resolution(layout_width, layout_height)
         prompt = build_panel_prompt(comic, panel)
-        bound_workflow = profile.apply_inputs(workflow, _profile_values(panel, prompt, width, height, settings))
+        values = _profile_values(panel, prompt, width, height, settings)
+        bound_workflow = profile.apply_inputs(workflow, values)
+        validate_diffusion_prompts(
+            panel_id=panel.id,
+            positive_prompt=prompt,
+            negative_prompt=str(values["negative_prompt"] or ""),
+            bound_workflow=bound_workflow,
+        )
         prompt_id = client.submit(bound_workflow)
         images = client.wait_for_images(prompt_id, profile.output_node_id)
         image_bytes = client.download_image(images[0])
@@ -344,6 +352,9 @@ def render_comic_schema(
         raise ValueError("layout_mode must be auto, simple, or manual.")
     if image_fit not in {"cover", "contain"}:
         raise ValueError("image_fit must be cover or contain.")
+    # Direct rendering and older saved storyboards bypass generation-time
+    # validation, so enforce the same policy before any panel is submitted.
+    validate_metadata_payload(schema, path="storyboard")
     out_dir = Path(CONFIG.paths.panel_dir).parent
     job_dir = out_dir / "jobs" / job_id
     panel_dir = job_dir / "panels"

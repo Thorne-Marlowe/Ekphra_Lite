@@ -110,6 +110,8 @@ Your job is to convert the Writer's script into a strict JSON schema for the AI 
 ## STRICT CHARACTER ENFORCEMENT
 Create the cast from the user's idea; no separate Lore or Writer script is supplied.
 Register every visible character in characters, and list only those visible in each panel's active_char_ids.
+All intentionally depicted human or humanlike figures, including foreground and background figures, photographs,
+paintings, flashbacks, and memories, must be unambiguously adults aged 18 or older. Never describe or depict minors.
 
 ## CORE RESPONSIBILITIES
 1. Break down the script for the current page into clear, visual panels.
@@ -143,7 +145,7 @@ Use a clear setup, consequence and visual payoff. The following formulas are opt
    - *Setup:* A very mundane, everyday conflict or small annoyance.
    - *Punchline:* The reaction is completely disproportionate, escalating into an apocalyptic event or absurd meme (e.g., sharing popcorn at the cinema turns into a full communist revolution).
 3. **Visual Contradiction (Miệng nói một đằng, hình một nẻo):**
-   - *Setup/Punchline:* The character says something incredibly positive, calm, or polite, but the VISUAL ART shows they are suffering, being destroyed, or in absolute chaos (e.g., A father calmly saying "Being a dad is so peaceful" while the baby is vomiting on his face).
+   - *Setup/Punchline:* The character says something incredibly positive, calm, or polite, but the VISUAL ART shows they are suffering, being destroyed, or in absolute chaos (e.g., an adult chef calmly saying "This service is peaceful" while green sauce spills over the kitchen).
 ## DIALOGUE RULES (SHOW, DON'T TELL - CRITICAL)
 1. **No Info-Dumping / Stating the Obvious:** If the art shows a room is on fire, DO NOT have a character say "The room is on fire!" They should say "Get out!". If the art shows a big fish, DO NOT say "Look, a big fish!". They should say "It's pulling me in!".
 2. **Economy of Words:** Keep dialogue sparse. Maximum 20 words per dialogue box.
@@ -168,8 +170,8 @@ You must output a JSON object with this exact structure:
   "characters": {{
     "char_dad": {{
       "name": "Dad",
-      "description": "A tired new father.",
-      "base_prompt_en": "male, mid-30s, short messy black hair, dark bags under eyes, wearing a grey t-shirt"
+      "description": "A tired adult father in his mid-thirties.",
+      "base_prompt_en": "adult man, mid-30s, short messy black hair, dark bags under eyes, wearing a grey t-shirt"
     }}
   }},
   "pages": [
@@ -178,11 +180,11 @@ You must output a JSON object with this exact structure:
       "panels": [
         {{
           "id": "panel_1_1",
-          "panel_prompt_en": "calm expression, holding a baby, baby vomiting green liquid violently onto father's face, messy living room",
+          "panel_prompt_en": "calm expression, green slime splashed across the adult father's face in a messy living room",
           "panel_negative_en": "",
           "active_char_ids": ["char_dad"],
           "character_actions": {{
-            "char_dad": {{ "action_en": "holding baby", "pose_en": "sitting still" }}
+            "char_dad": {{ "action_en": "sitting still beneath the splash", "pose_en": "leaning back" }}
           }},
           "dialogues": [
             {{ "character_id": "char_dad", "text": "Làm bố nhàn lắm các bạn ạ.", "emotion": "calm" }}
@@ -292,6 +294,8 @@ or random absurdity. Return JSON only with title, language, tone, trope, charact
 personality_contrast, fixed_visual_identity), and beats (panel, role, event, required_subjects, required_action,
 required_props, required_text, dialogue_intent, payoff). Use `required_text` only for text that must be
 composited or checked verbatim (labels, signs, screens), never spoken dialogue; use an empty list when the beat has no text.
+All intentionally depicted human or humanlike figures, including background figures, photographs, paintings,
+flashbacks, and memories, must be unambiguously adults aged 18 or older. Do not plan or describe minors.
 The plan must explicitly mark the primary
 subject, secondary subject, and visual hierarchy for each beat; do not add characters
 that are not required by the user's idea."""

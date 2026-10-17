@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from policy.adult_only import adult_only_errors
+
 
 _PAUSE_THEN_ACTION = re.compile(
     r"^(?P<subject>.+?)\s+(?P<hold>pauses|holds|remains|stands|stays)(?P<detail>[^,;]*),\s*(?:and\s+)?then\s+(?P<next>.+)$",
@@ -67,6 +69,9 @@ def validate_storyboard_structure(schema: Any, requested_pages: int) -> list[str
     errors: list[str] = []
     if not isinstance(schema, dict):
         return ["Storyboard must be a JSON object."]
+    # Include optional and nested prose fields, not only fields that today's
+    # renderer consumes. Saved storyboards receive the same policy at render.
+    errors.extend(adult_only_errors(schema, "storyboard"))
     characters = schema.get("characters")
     if not isinstance(characters, dict):
         errors.append("Storyboard must contain a characters object.")

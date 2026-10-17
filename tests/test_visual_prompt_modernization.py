@@ -1,13 +1,16 @@
 import os
+import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
 
+from langchain_core.runnables import RunnableLambda
 from panel_engine.comfy_renderer import build_panel_prompt
-from studio_graph.agents import merge_approved_dialogues
+from studio_graph.agents import merge_approved_dialogues, run_storyboarder
 from studio_graph.prompts import STORYBOARDER_SYSTEM_PROMPT
-from studio_graph.validation import normalize_single_frame_actions
 from utils.parser import load_comic_from_json
 
 
@@ -16,6 +19,9 @@ class VisualPromptModernizationTests(unittest.TestCase):
         self.assertNotIn("STABLE DIFFUSION 1.5", STORYBOARDER_SYSTEM_PROMPT)
         self.assertNotIn("speaking, talking, open mouth", STORYBOARDER_SYSTEM_PROMPT)
         self.assertNotIn("blurry, distorted, deformed hands", STORYBOARDER_SYSTEM_PROMPT)
+
+    def test_storyboard_instructions_allow_brief_temporal_context(self):
+        self.assertIn("Brief temporal context is allowed", STORYBOARDER_SYSTEM_PROMPT)
 
     def test_final_prompt_preserves_identity_props_camera_and_meaningful_hierarchy(self):
         comic, panel = self._comic({
@@ -49,6 +55,101 @@ class VisualPromptModernizationTests(unittest.TestCase):
 
         self.assertEqual(prompt.casefold().count("nyx holds a weathered map"), 1)
 
+    def test_character_actions_keep_each_action_with_its_actor(self):
+        comic, panel = self._two_character_comic({
+            "panel_prompt_en": "Lena and Jai sit together in the quiet music room.",
+            "character_actions": {
+                "lena": {"action_en": "plays the violin", "pose_en": "standing beside Jai"},
+                "jai": {"action_en": "listens with his eyes closed", "pose_en": "seated in a chair"},
+            },
+        })
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertIn("Lena plays the violin", prompt)
+        self.assertIn("Jai listens with his eyes closed", prompt)
+        self.assertNotIn("Jai plays the violin", prompt)
+
+    def test_action_already_expressed_in_panel_prose_is_not_repeated(self):
+        comic, panel = self._two_character_comic({
+            "panel_prompt_en": "Medium shot. Lena plays the violin while Jai listens with closed eyes.",
+            "character_actions": {
+                "lena": {"action_en": "playing violin"},
+                "jai": {"action_en": "listening with closed eyes"},
+            },
+        })
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertEqual(prompt.casefold().count("lena plays the violin"), 1)
+        self.assertNotIn("Lena playing violin", prompt)
+
+    def test_structured_subject_ids_are_rendered_as_registered_names(self):
+        comic, panel = self._two_character_comic({
+            "primary_subject": "lena",
+            "secondary_subject": "jai (background)",
+            "visual_hierarchy": ["lena", "jai's hand"],
+            "panel_prompt_en": "Lena reaches toward Jai in the music room.",
+        })
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertIn("primary subject: Lena", prompt)
+        self.assertIn("secondary subject: Jai (background)", prompt)
+        self.assertNotIn("primary subject: lena", prompt)
+
+    def test_panel_prose_wins_over_conflicting_lower_precedence_action(self):
+        comic, panel = self._two_character_comic({
+            "panel_prompt_en": "Medium close-up. Jai has stopped playing; the violin rests across his lap while Lena touches his hand.",
+            "required_action": "Lena touches Jai's hand while he plays the violin",
+            "character_actions": {"jai": {"action_en": "playing violin"}},
+        })
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertIn("Jai has stopped playing", prompt)
+        self.assertNotIn("action: Lena touches Jai's hand while he plays", prompt)
+        self.assertNotIn("Jai playing violin", prompt)
+
+    def test_jai_stopping_does_not_suppress_lenas_independent_playing_action(self):
+        comic, panel = self._two_character_comic({
+            "panel_prompt_en": "Jai has stopped playing and rests his violin in his lap while Lena waits beside him.",
+            "character_actions": {
+                "jai": {"action_en": "playing violin"},
+                "lena": {"action_en": "playing violin"},
+            },
+        })
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertNotIn("Jai playing violin", prompt)
+        self.assertIn("Lena playing violin", prompt)
+
+    def test_explicit_panel_framing_overrides_character_card_camera(self):
+        comic, panel = self._comic({"panel_prompt_en": "Close-up of Nyx studying a map."}, camera_distance="wide shot")
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertIn("Close-up of Nyx", prompt)
+        self.assertNotIn("camera: wide shot", prompt)
+
+    def test_temporal_context_survives_assembly(self):
+        comic, panel = self._comic({
+            "panel_prompt_en": "After the final note fades, Nyx holds the map against her chest in the rain.",
+        })
+
+        self.assertIn("After the final note fades", build_panel_prompt(comic, panel))
+
+    def test_edited_panel_prompt_is_used_on_the_next_assembly(self):
+        comic, panel = self._comic({"panel_prompt_en": "Nyx studies a map in the station."})
+        original = build_panel_prompt(comic, panel)
+        panel.panel_prompt_en = "Nyx studies a map beneath a flickering platform sign."
+
+        edited = build_panel_prompt(comic, panel)
+
+        self.assertNotEqual(original, edited)
+        self.assertIn("flickering platform sign", edited)
+
     def test_saved_storyboard_style_without_optional_camera_fields_remains_compatible(self):
         comic, panel = self._comic({
             "panel_prompt_en": "preserve the registered recurring cast and approved setting; Nyx studies a map",
@@ -81,19 +182,45 @@ class VisualPromptModernizationTests(unittest.TestCase):
         self.assertEqual(panel["panel_prompt_en"], "Nyx studies a map")
         self.assertEqual(panel["dialogues"][0]["text"], "This route is wrong.")
 
-    def test_safe_temporal_action_is_collapsed_and_ambiguous_sequence_is_reported(self):
-        safe = {"pages": [{"panels": [{"required_action": "Elias pauses mid-grunt, then looks up at Nyx"}]}]}
-        self.assertEqual(normalize_single_frame_actions(safe), [])
-        self.assertEqual(safe["pages"][0]["panels"][0]["required_action"], "Elias pauses mid-grunt while looking up at Nyx")
+    def test_storyboarder_preserves_temporal_context_without_a_retry_error(self):
+        schema = {
+            "characters": {"nyx": {"name": "Nyx", "base_prompt_en": "silver android"}},
+            "pages": [{"page_number": 1, "panels": [
+                {"id": "p1", "panel_prompt_en": "After the train leaves, Nyx holds a map in the rain.", "active_char_ids": ["nyx"], "dialogues": []},
+                {"id": "p2", "panel_prompt_en": "Nyx watches the empty platform.", "active_char_ids": ["nyx"], "dialogues": []},
+            ]}],
+        }
+        state = {
+            "user_prompt": "Nyx misses a train.", "pageCount": 1, "current_schema": {},
+            "validation_errors": [], "story_plan": {}, "dialogue_plan": {"dialogues": []},
+        }
+        storyboarder = RunnableLambda(lambda _: SimpleNamespace(content=json.dumps(schema)))
 
-        ambiguous = {"pages": [{"panels": [{
-            "required_action": "Nyx blinks rapidly, then smiles faintly",
-            "panel_prompt_en": "Nyx blinks rapidly, then smiles faintly in the station",
-        }]}]}
-        errors = normalize_single_frame_actions(ambiguous)
-        self.assertEqual(len(errors), 2)
-        self.assertIn("use one drawable instant", errors[0])
-        self.assertEqual(ambiguous["pages"][0]["panels"][0]["required_action"], "Nyx blinks rapidly, then smiles faintly")
+        with patch("studio_graph.agents.storyboarder_llm", storyboarder):
+            result = run_storyboarder(state)
+
+        self.assertEqual(result["validation_errors"], [])
+        self.assertEqual(result["current_schema"]["pages"][0]["panels"][0]["panel_prompt_en"], schema["pages"][0]["panels"][0]["panel_prompt_en"])
+
+    def test_last_melody_panel_four_remains_compatible(self):
+        comic, panel = self._two_character_comic({
+            "primary_subject": "Lena",
+            "secondary_subject": "Jai listening",
+            "visual_hierarchy": ["Lena", "violin"],
+            "required_action": "Lena plays the melody, Jai listens with closed eyes",
+            "required_props": ["violin now held by Lena"],
+            "panel_prompt_en": "Full-body shot. Lena plays the violin with a clear, soothing melody. Jai smiles softly with his closed eyes.",
+            "character_actions": {
+                "jai": {"action_en": "listening with closed eyes", "pose_en": "sitting quietly"},
+                "lena": {"action_en": "playing the violin", "pose_en": "holding it confidently"},
+            },
+        })
+
+        prompt = build_panel_prompt(comic, panel)
+
+        self.assertIn("Full-body shot", prompt)
+        self.assertIn("Lena", prompt)
+        self.assertIn("Jai", prompt)
 
     @staticmethod
     def _comic(panel_fields, camera_angle="", camera_distance=""):
@@ -111,6 +238,22 @@ class VisualPromptModernizationTests(unittest.TestCase):
                 "id": "p1", "panel_prompt_en": "Nyx studies a map", "active_char_ids": ["nyx"],
                 "dialogues": [{"character_id": "nyx", "text": "A spoken line", "emotion": "calm"}],
                 **panel_fields,
+            }]}],
+        }
+        comic = load_comic_from_json(data)
+        return comic, comic.panels[0]
+
+    @staticmethod
+    def _two_character_comic(panel_fields):
+        data = {
+            "characters": {
+                "lena": {"name": "Lena", "base_prompt_en": "young violinist with a blue sweater"},
+                "jai": {"name": "Jai", "base_prompt_en": "older musician with a black turtleneck"},
+            },
+            "background": {"prompt_en": "quiet music room at dusk"},
+            "pages": [{"page_number": 1, "panels": [{
+                "id": "panel_1_4", "panel_prompt_en": "Lena and Jai in a music room",
+                "active_char_ids": ["lena", "jai"], "dialogues": [], **panel_fields,
             }]}],
         }
         comic = load_comic_from_json(data)

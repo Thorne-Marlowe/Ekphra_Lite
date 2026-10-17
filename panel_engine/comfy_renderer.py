@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable
@@ -17,6 +18,15 @@ from utils.parser import Comic, Panel, load_comic_from_json
 
 
 _LEGACY_CONTINUITY_PREFIX = "preserve the registered recurring cast and approved setting;"
+_PANEL_FRAMING = re.compile(
+    r"\b(?:close[- ]up|medium(?:[- ](?:close|wide))? shot|wide shot|full[- ]body|"
+    r"eye[- ]level|low[- ]angle|high[- ]angle|over[- ]the[- ]shoulder)\b",
+    re.IGNORECASE,
+)
+_STOPPED_ACTION = re.compile(
+    r"\b(?:stopped|stops|no longer|not)\s+(?:\w+\s+){0,2}?(?P<verb>\w+ing)\b",
+    re.IGNORECASE,
+)
 
 
 def _field_text(value: Any) -> str:
@@ -52,6 +62,120 @@ def _camera_description(comic: Comic, panel: Panel) -> str:
     return descriptions[0] if len(descriptions) == 1 else ""
 
 
+def _panel_has_explicit_framing(panel: Panel) -> bool:
+    return bool(_PANEL_FRAMING.search(_without_legacy_continuity_prefix(panel.panel_prompt_en)))
+
+
+def _phrase_is_already_present(value: Any, scene_text: str) -> bool:
+    """Return true only for a useful exact-ish authored duplication."""
+    phrase = _normalized_field_text(value)
+    scene = _normalized_field_text(scene_text)
+    return bool(phrase and (phrase in scene or scene in phrase))
+
+
+def _word_stem(word: str) -> str:
+    """Small deterministic inflection normalizer used only for de-duplication."""
+    if len(word) > 5 and word.endswith("ing"):
+        return word[:-3]
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith("es"):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s"):
+        return word[:-1]
+    return word
+
+
+def _action_is_already_present(value: Any, scene_text: str, actor_name: str = "") -> bool:
+    if _phrase_is_already_present(value, scene_text):
+        return True
+    scene_for_terms = _normalized_field_text(scene_text)
+    if actor_name:
+        # A different character's "stopped playing" must not make this
+        # character's independent "playing" action appear duplicated.
+        for match in reversed(list(_STOPPED_ACTION.finditer(scene_for_terms))):
+            if not _actor_is_named_before(scene_for_terms, match.start(), actor_name):
+                scene_for_terms = scene_for_terms[:match.start("verb")] + scene_for_terms[match.end("verb"):]
+    ignored = {"a", "an", "the", "with", "and", "at", "in", "of", "to", "is", "are"}
+    terms = {
+        _word_stem(word)
+        for word in re.findall(r"[a-z0-9]+", _normalized_field_text(value))
+        if word not in ignored
+    }
+    scene_terms = {
+        _word_stem(word)
+        for word in re.findall(r"[a-z0-9]+", scene_for_terms)
+        if word not in ignored
+    }
+    return len(terms) >= 2 and len(terms & scene_terms) / len(terms) >= 0.8
+
+
+def _actor_is_named_before(text: str, position: int, actor_name: str) -> bool:
+    """Whether an explicitly stopped action belongs to this assembled actor."""
+    actor_terms = [term for term in re.findall(r"[a-z0-9]+", actor_name.casefold()) if len(term) > 1]
+    if not actor_terms:
+        return True
+    clause = text[:position].rsplit(".", 1)[-1]
+    return any(re.search(rf"\b{re.escape(term)}\b", clause) for term in actor_terms)
+
+
+def _conflicting_action(left: Any, right: Any, actor_name: str = "") -> bool:
+    """Detect a narrow, explicit stopped-versus-continuing action conflict.
+
+    Prompt composition must not guess at nuanced prose.  This deliberately
+    handles only an objectively incompatible state such as "stopped playing"
+    alongside "still playing"; other wording is retained as approved context.
+    """
+    left_text = _normalized_field_text(left)
+    right_text = _normalized_field_text(right)
+    if not left_text or not right_text:
+        return False
+    for stopped, other in ((left_text, right_text), (right_text, left_text)):
+        match = _STOPPED_ACTION.search(stopped)
+        if match and actor_name and not _actor_is_named_before(stopped, match.start(), actor_name):
+            continue
+        other_terms = {_word_stem(word) for word in re.findall(r"[a-z0-9]+", other)}
+        if match and _word_stem(match.group("verb").casefold()) in other_terms:
+            return True
+    return False
+
+
+def _action_is_compatible_with_panel_prose(panel: Panel, action: Any, actor_name: str = "") -> bool:
+    """Panel prose wins over a lower-precedence incompatible action field."""
+    scene = _without_legacy_continuity_prefix(panel.panel_prompt_en)
+    return not _conflicting_action(scene, action, actor_name)
+
+
+def _character_action_descriptions(character_name: str, action: Any) -> list[str]:
+    """Keep each structured action detail attached to its actor."""
+    if not action:
+        return []
+    pieces: list[str] = []
+    action_text = _field_text(getattr(action, "action_en", ""))
+    pose = _field_text(getattr(action, "pose_en", ""))
+    objects = _field_text(getattr(action, "objects", []))
+    interaction = _field_text(getattr(action, "interaction", ""))
+    if action_text:
+        pieces.append(action_text if _normalized_field_text(action_text).startswith(_normalized_field_text(character_name))
+                      else f"{character_name} {action_text}")
+    if pose:
+        pieces.append(f"{character_name} {pose}")
+    if objects and not _phrase_is_already_present(objects, ", ".join(pieces)):
+        pieces.append(f"with {objects}")
+    if interaction:
+        pieces.append(interaction)
+    return [piece for piece in pieces if piece]
+
+
+def _subject_text(comic: Comic, value: Any) -> str:
+    """Use readable registered names without modifying the source field."""
+    text = _field_text(value)
+    for character_id, character in comic.characters.items():
+        if character.name:
+            text = re.sub(rf"\b{re.escape(character_id)}\b", character.name, text)
+    return text
+
+
 def _hierarchy_adds_information(hierarchy: Any, primary: Any, secondary: Any) -> bool:
     normalized = _normalized_field_text(hierarchy)
     if not normalized:
@@ -65,14 +189,21 @@ def _hierarchy_adds_information(hierarchy: Any, primary: Any, secondary: Any) ->
 
 
 def build_panel_prompt(comic: Comic, panel: Panel) -> str:
-    """Assemble one concrete prompt without model-family-specific syntax.
+    """Assemble the approved panel fields into one renderer-ready scene.
 
-    Character cards establish identity; primary/secondary subjects establish
-    composition; action and props establish the drawable beat; panel prose
-    supplies any remaining visual detail; and the panel/global background
-    supplies setting. `required_subjects`, character actions/positions, and
-    required text remain validation, layout, or lettering data rather than
-    being blindly concatenated into image conditioning.
+    Precedence is deterministic: panel_prompt_en is the approved scene prose
+    (including any explicit framing); character cards supply identity; primary
+    and secondary subjects plus visual_hierarchy supply composition; required
+    action and per-character actions supply missing, non-conflicting physical
+    detail; required props supply missing objects; and panel background wins
+    over the comic background.  When panel prose explicitly says an action has
+    stopped while a lower-precedence action says it continues, the panel prose
+    wins and the conflicting lower-precedence field is omitted, never combined
+    or written back to the saved storyboard.
+
+    required_subjects, character_positions, required_text, dialogues, and
+    negative prompt fields remain validation/layout/lettering or renderer-
+    profile data and are intentionally not positive-prompt prose.
     """
     parts: list[str] = []
     seen: set[str] = set()
@@ -89,14 +220,27 @@ def build_panel_prompt(comic: Comic, panel: Panel) -> str:
         character = comic.characters.get(character_id)
         if character and character.base_prompt_en:
             add(character.name or character_id, character.base_prompt_en)
-    add("primary subject", panel.primary_subject)
-    add("secondary subject", panel.secondary_subject)
+    scene_prose = _without_legacy_continuity_prefix(panel.panel_prompt_en)
+    add("primary subject", _subject_text(comic, panel.primary_subject))
+    add("secondary subject", _subject_text(comic, panel.secondary_subject))
     if _hierarchy_adds_information(panel.visual_hierarchy, panel.primary_subject, panel.secondary_subject):
-        add("visual priority", panel.visual_hierarchy)
-    add("action", panel.required_action)
-    add("required props", panel.required_props)
-    add("camera", _camera_description(comic, panel))
-    add("", _without_legacy_continuity_prefix(panel.panel_prompt_en))
+        add("visual priority", _subject_text(comic, panel.visual_hierarchy))
+    if (_action_is_compatible_with_panel_prose(panel, panel.required_action)
+            and not _action_is_already_present(panel.required_action, scene_prose)):
+        add("action", panel.required_action)
+    for character_id in panel.active_char_ids:
+        character = comic.characters.get(character_id)
+        action = panel.character_actions.get(character_id)
+        descriptions = _character_action_descriptions((character.name if character else character_id) or character_id, action)
+        for description in descriptions:
+            if (_action_is_compatible_with_panel_prose(panel, description, character.name if character else character_id)
+                    and not _action_is_already_present(description, scene_prose, character.name if character else character_id)):
+                add("", description)
+    if not _phrase_is_already_present(panel.required_props, scene_prose):
+        add("required props", panel.required_props)
+    if not _panel_has_explicit_framing(panel):
+        add("camera", _camera_description(comic, panel))
+    add("", scene_prose)
     if panel.background_prompt_en:
         add("setting", panel.background_prompt_en)
     elif comic.background and comic.background.prompt_en:

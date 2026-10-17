@@ -19,7 +19,7 @@ from .structured_output import (
     STORY_PLAN_SCHEMA,
     create_structured_llm,
 )
-from .validation import normalize_single_frame_actions, validate_storyboard_structure
+from .validation import validate_storyboard_structure
 import os
 import base64
 import logging
@@ -512,11 +512,6 @@ def run_storyboarder(state: StudioState) -> StudioState:
         schema = parse_json_content(res.content)
         _apply_story_constraints(schema, state.get("story_plan", {}))
         _normalize_panel_schema(schema)
-        temporal_errors = normalize_single_frame_actions(schema)
-        if temporal_errors:
-            state["current_schema"] = schema
-            state["validation_errors"] = temporal_errors
-            return state
         # Character cards are immutable across validator/Vision retries.  A
         # fresh storyboard draft must not silently replace the registered cast.
         previous_characters = state.get("current_schema", {}).get("characters", {})

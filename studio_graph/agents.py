@@ -639,7 +639,11 @@ def run_story_planner(state: StudioState) -> StudioState:
         state["next_step"] = "dialogue_writer"
     except Exception as exc:
         state["validation_errors"] = [f"Story plan JSON error: {exc}"]
-        state["next_step"] = "story_planner"
+        # The graph routes Planner output by generation_error, not next_step.
+        # Do not let malformed Planner output reach the Dialogue Writer as an
+        # empty or stale plan.
+        state["generation_error"] = state["validation_errors"][0]
+        state["next_step"] = "failed"
     return state
 
 
@@ -814,7 +818,11 @@ def run_dialogue_writer(state: StudioState) -> StudioState:
         state["next_step"] = "storyboarder"
     except Exception as exc:
         state["validation_errors"] = [f"Dialogue plan JSON error: {exc}"]
-        state["next_step"] = "dialogue_writer"
+        # The graph routes Dialogue Writer output by generation_error, not
+        # next_step.  Stop here instead of sending malformed dialogue data to
+        # the Storyboard Artist.
+        state["generation_error"] = state["validation_errors"][0]
+        state["next_step"] = "failed"
     return state
 
 

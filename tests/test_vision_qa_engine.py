@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from panel_engine.job_status import mark_completed, start_render
-from vision_qa.engine import VisionQAEngine, VisionQAError
+from vision_qa.engine import PAGE_CATEGORIES, RAW_CATEGORIES, VisionQAEngine, VisionQAError
 
 
 def save_image(path: Path, color: str = "navy") -> None:
@@ -75,8 +75,9 @@ class VisionQAEngineTests(unittest.TestCase):
     @staticmethod
     def _factory(client):
         def factory(**kwargs):
-            factory.kwargs = kwargs
+            factory.calls.append(kwargs)
             return client
+        factory.calls = []
         return factory
 
     @staticmethod
@@ -104,8 +105,21 @@ class VisionQAEngineTests(unittest.TestCase):
             self.assertEqual((job / "story.json").read_bytes(), story_before)
             self.assertEqual((job / "panels" / "panel_1_1.png").read_bytes(), raw_before)
             self.assertEqual((root / "comic_page_job_1.png").read_bytes(), page_before)
-            self.assertEqual(factory.kwargs["model"], "local-vision")
-            self.assertEqual(factory.kwargs["max_retries"], 0)
+            self.assertEqual(len(factory.calls), 2)
+            self.assertTrue(all(call["model"] == "local-vision" for call in factory.calls))
+            self.assertTrue(all(call["max_retries"] == 0 for call in factory.calls))
+            raw_schema = factory.calls[0]["model_kwargs"]["response_format"]["json_schema"]["schema"]
+            page_schema = factory.calls[1]["model_kwargs"]["response_format"]["json_schema"]["schema"]
+            raw_categories = raw_schema["properties"]["observations"]["items"]["properties"]["category"]["enum"]
+            page_categories = page_schema["properties"]["observations"]["items"]["properties"]["category"]["enum"]
+            self.assertEqual(raw_categories, sorted(RAW_CATEGORIES))
+            self.assertEqual(page_categories, sorted(PAGE_CATEGORIES))
+            raw_instruction = client.calls[0][1]["content"][0]["text"]
+            page_instruction = client.calls[1][1]["content"][0]["text"]
+            for category in RAW_CATEGORIES:
+                self.assertIn(f"`{category}`", raw_instruction)
+            for category in PAGE_CATEGORIES:
+                self.assertIn(f"`{category}`", page_instruction)
 
     def test_multi_page_qa_assesses_every_raw_panel_and_page(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -206,6 +220,20 @@ class VisionQAEngineTests(unittest.TestCase):
             report = json.loads(VisionQAEngine(root, model="local-vision", client_factory=self._factory(client)).run("job").read_text())
             self.assertEqual(report["status"], "partial")
             self.assertIn("unsupported category", report["raw_panels"][0]["error"])
+
+    def test_supported_categories_are_accepted_and_cross_context_categories_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "outputs"
+            self._completed_job(root)
+            client = FakeVisionClient([
+                self._valid("obvious_visual_defect"),
+                self._valid("identity"),
+            ])
+            report = json.loads(VisionQAEngine(root, model="local-vision", client_factory=self._factory(client)).run("job").read_text())
+            self.assertEqual(report["raw_panels"][0]["status"], "assessed")
+            self.assertEqual(report["raw_panels"][0]["observations"][0]["category"], "obvious_visual_defect")
+            self.assertEqual(report["pages"][0]["status"], "error")
+            self.assertIn("unsupported category 'identity'", report["pages"][0]["error"])
 
     def test_partial_image_failure_preserves_other_assessments_and_existing_reports(self):
         with tempfile.TemporaryDirectory() as directory:

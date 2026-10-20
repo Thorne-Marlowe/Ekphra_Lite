@@ -30,27 +30,34 @@ PAGE_CATEGORIES = {
 SEVERITIES = {"info", "minor", "major"}
 CONFIDENCES = {"high", "medium", "low", "not_assessable"}
 
-ASSESSMENT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["observations"],
-    "properties": {
-        "observations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["category", "severity", "confidence", "explanation"],
-                "properties": {
-                    "category": {"type": "string"},
-                    "severity": {"enum": ["info", "minor", "major"]},
-                    "confidence": {"enum": ["high", "medium", "low", "not_assessable"]},
-                    "explanation": {"type": "string"},
+def _assessment_schema(categories: set[str]) -> dict[str, Any]:
+    """Build one context-specific response schema from the authoritative IDs."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["observations"],
+        "properties": {
+            "observations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["category", "severity", "confidence", "explanation"],
+                    "properties": {
+                        "category": {"enum": sorted(categories)},
+                        "severity": {"enum": sorted(SEVERITIES)},
+                        "confidence": {"enum": sorted(CONFIDENCES)},
+                        "explanation": {"type": "string"},
+                    },
                 },
             },
         },
-    },
-}
+    }
+
+
+def _category_instruction(categories: set[str]) -> str:
+    identifiers = ", ".join(f"`{category}`" for category in sorted(categories))
+    return f" Use category exactly one of: {identifiers}."
 
 
 class VisionQAError(RuntimeError):
@@ -160,7 +167,7 @@ class VisionQAEngine:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(**kwargs)
 
-    def _client(self) -> Any:
+    def _client(self, categories: set[str]) -> Any:
         if not self.model:
             raise VisionQAError("OPENAI_VISION_MODEL must name a vision-capable local model; no text-model fallback is used.")
         return self.client_factory(
@@ -169,7 +176,9 @@ class VisionQAEngine:
             base_url=self.base_url,
             timeout=self.timeout_seconds,
             max_retries=0,
-            model_kwargs={"response_format": json_schema_response_format("vision_qa_assessment", ASSESSMENT_SCHEMA)},
+            model_kwargs={"response_format": json_schema_response_format(
+                "vision_qa_assessment", _assessment_schema(categories)
+            )},
         )
 
     @staticmethod
@@ -324,9 +333,11 @@ class VisionQAEngine:
         try:
             client_error: str | None = None
             try:
-                client = self._client()
+                raw_client = self._client(RAW_CATEGORIES)
+                page_client = self._client(PAGE_CATEGORIES)
             except Exception as exc:
-                client = None
+                raw_client = None
+                page_client = None
                 client_error = str(exc)
             report: dict[str, Any] = {
                 "version": 1,
@@ -344,13 +355,18 @@ class VisionQAEngine:
                 report["errors"].append({"scope": "run", "error": f"Vision model unavailable: {client_error}"})
             for page_number, panel in panels:
                 entry: dict[str, Any] = {"panel_id": panel["id"], "page_number": page_number, "status": "error", "observations": []}
-                if client is None:
+                if raw_client is None:
                     entry["error"] = "Vision model unavailable."
                 else:
                     try:
                         entry["observations"] = self._assess(
-                            client, image_path=job_dir / "panels" / f"{panel['id']}.png",
-                            instruction="Assess this raw comic panel for visible character consistency, required actions and objects, composition, and obvious visual defects. Do not require perfection or infer unseen story details.",
+                            raw_client, image_path=job_dir / "panels" / f"{panel['id']}.png",
+                            instruction=(
+                                "Assess this raw comic panel for visible character consistency, required actions and "
+                                "objects, composition, and obvious visual defects. Do not require perfection or infer "
+                                "unseen story details."
+                                + _category_instruction(RAW_CATEGORIES)
+                            ),
                             context=self._raw_context(story, panel), categories=RAW_CATEGORIES,
                         )
                         entry["status"] = "assessed"
@@ -373,13 +389,18 @@ class VisionQAEngine:
                     "layout": layout,
                 }
                 entry = {"page_number": page_number, "panel_ids": context["panel_ids"], "status": "error", "observations": []}
-                if client is None:
+                if page_client is None:
                     entry["error"] = "Vision model unavailable."
                 else:
                     try:
                         entry["observations"] = self._assess(
-                            client, image_path=page_path,
-                            instruction="Assess this composed comic page for dialogue readability, bubble placement, obvious lettering clipping or overlap, and layout problems. Assess speaker attribution only where the image itself supports it; otherwise use confidence not_assessable and severity info.",
+                            page_client, image_path=page_path,
+                            instruction=(
+                                "Assess this composed comic page for dialogue readability, bubble placement, obvious lettering "
+                                "clipping or overlap, and layout problems. Assess speaker attribution only where the image itself "
+                                "supports it; otherwise use confidence not_assessable and severity info."
+                                + _category_instruction(PAGE_CATEGORIES)
+                            ),
                             context=context, categories=PAGE_CATEGORIES,
                         )
                         entry["status"] = "assessed"

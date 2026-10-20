@@ -17,8 +17,16 @@ def create_storyboard_graph() -> StateGraph:
     workflow.add_node("storyboarder", run_storyboarder)
     workflow.add_node("validator", run_validator)
     workflow.set_entry_point("story_planner")
-    workflow.add_edge("story_planner", "dialogue_writer")
-    workflow.add_edge("dialogue_writer", "storyboarder")
+    workflow.add_conditional_edges(
+        "story_planner",
+        lambda state: "failed" if state.get("generation_error") else "dialogue_writer",
+        {"dialogue_writer": "dialogue_writer", "failed": END},
+    )
+    workflow.add_conditional_edges(
+        "dialogue_writer",
+        lambda state: "failed" if state.get("generation_error") else "storyboarder",
+        {"storyboarder": "storyboarder", "failed": END},
+    )
     workflow.add_edge("storyboarder", "validator")
     workflow.add_conditional_edges(
         "validator",

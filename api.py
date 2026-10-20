@@ -23,6 +23,10 @@ from panel_engine.comfy_renderer import render_comic_schema
 from panel_engine.job_status import completed_job_pages, load_manifest
 from page.layouts import compatible_layout_names
 from studio_graph.graph import create_storyboard_graph
+from studio_graph.narrative_contract import (
+    NarrativeContractError,
+    resolve_creative_intent,
+)
 from utils.parser import load_comic_from_json
 from vision_qa.engine import (
     CONFIDENCES,
@@ -51,6 +55,7 @@ storyboard_graph = create_storyboard_graph()
 class StoryboardRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10000)
     pageCount: int = Field(default=1, ge=1, le=8)
+    creativeIntent: dict | None = None
 
 
 class RenderRequest(BaseModel):
@@ -270,12 +275,23 @@ async def invoke_storyboard_graph(state: dict, request: Request) -> dict:
 
 @app.post("/api/storyboards")
 async def create_storyboard(req: StoryboardRequest, request: Request):
+    try:
+        requested_intent, inferred_intent, effective_intent, intent_sources = resolve_creative_intent(
+            req.creativeIntent
+        )
+    except NarrativeContractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     state = {
         "generation_id": uuid.uuid4().hex, "user_prompt": req.prompt, "requested_language": "",
         "current_schema": {}, "story_plan": {}, "dialogue_plan": {}, "normalization_notes": [], "vision_qa": {},
         "vision_retry_count": 0, "max_vision_retries": 0, "validation_errors": [],
         "next_step": "", "pageCount": req.pageCount, "retry_count": 0,
         "max_retries": CONFIG.story.max_retries, "generation_error": "",
+        "requested_creative_intent": requested_intent,
+        "inferred_creative_intent": inferred_intent,
+        "effective_creative_intent": effective_intent,
+        "creative_intent_sources": intent_sources,
+        "creative_intent_warnings": [],
     }
     try:
         final_state = await invoke_storyboard_graph(state, request)
@@ -291,7 +307,11 @@ async def create_storyboard(req: StoryboardRequest, request: Request):
     if not isinstance(schema, dict) or not schema.get("pages"):
         logger.error("Storyboard request ended without an approved schema: %s", final_state.get("validation_errors", []))
         raise HTTPException(status_code=422, detail=f"Storyboard was not approved: {final_state.get('validation_errors', [])}")
-    return {"storyboard": schema, "storyPlan": final_state.get("story_plan", {}), "dialoguePlan": final_state.get("dialogue_plan", {})}
+    response = {"storyboard": schema, "storyPlan": final_state.get("story_plan", {}), "dialoguePlan": final_state.get("dialogue_plan", {})}
+    intent = schema.get("metadata", {}).get("creative_intent") if isinstance(schema.get("metadata"), dict) else None
+    if intent is not None:
+        response["creativeIntent"] = intent
+    return response
 
 
 @app.post("/api/render-storyboard")

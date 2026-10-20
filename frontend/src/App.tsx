@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Image as ImageIcon, Pencil, RotateCcw, Save } from 'lucide-react'
 import { StoryboardRequestController } from './storyboardRequest'
 import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from './visionQa'
+import { buildStoryboardRequest, effectiveCreativeIntentEntries, GENRE_OPTIONS, RESOLUTION_OPTIONS, TONE_OPTIONS } from './creativeIntent'
 
 type Dialogue = { character_id?: string; text?: string; emotion?: string }
 type PanelMeta = { id: string; x: number; y: number; width: number; height: number; prompt: string; dialogues: Dialogue[] }
@@ -18,6 +19,9 @@ const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').
 export default function App() {
   const [idea, setIdea] = useState('')
   const [draft, setDraft] = useState('')
+  const [genre, setGenre] = useState('')
+  const [tone, setTone] = useState('')
+  const [narrativeResolution, setNarrativeResolution] = useState<'auto' | 'punchline' | 'cliffhanger' | 'revelation' | 'transition' | 'emotional_beat' | 'deliberate_nonresolution'>('auto')
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [profile, setProfile] = useState('')
   const [profileError, setProfileError] = useState('')
@@ -70,6 +74,10 @@ export default function App() {
         return { number: page.page_number || index + 1, count: Array.isArray(page.panels) ? page.panels.length : 0 }
       }) : []
     } catch { return [] }
+  }, [draft])
+
+  const effectiveCreativeIntent = useMemo(() => {
+    try { return effectiveCreativeIntentEntries(JSON.parse(draft)?.metadata?.creative_intent) } catch { return [] }
   }, [draft])
 
   const resolvedPageLayouts = () => Object.fromEntries(storyboardPages.map((page): [string, string] => {
@@ -125,7 +133,9 @@ export default function App() {
     setStoryboardLoading(true)
     setLoading(true); setMessage('Creating storyboard with the configured local LLM…')
     try {
-      const data = await api('/api/storyboards', { prompt: idea, pageCount: 1 }, controller.signal)
+      const data = await api('/api/storyboards', buildStoryboardRequest(
+        idea, 1, { genre, tone, narrativeResolution },
+      ), controller.signal)
       if (!storyboardRequest.current.isCurrent(requestId)) return
       setDraft(JSON.stringify(data.storyboard, null, 2))
       setMessage('Storyboard ready. Review or edit the JSON, then approve it for ComfyUI rendering.')
@@ -230,9 +240,15 @@ export default function App() {
       <section className="space-y-4 rounded-lg border bg-white p-5 shadow-sm">
         <label className="block text-sm font-medium">Prose source</label>
         <textarea value={idea} onChange={event => setIdea(event.target.value)} className="h-32 w-full rounded border p-3 text-sm" placeholder="Paste the scene or several paragraphs of prose…" />
+        <div className="grid gap-2 sm:grid-cols-3 text-sm">
+          <label>Genre<select value={genre} onChange={event => setGenre(event.target.value)} className="mt-1 w-full rounded border p-2"><option value="">Auto / Unspecified</option>{GENRE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>Tone<select value={tone} onChange={event => setTone(event.target.value)} className="mt-1 w-full rounded border p-2"><option value="">Auto / Unspecified</option>{TONE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>Narrative resolution<select value={narrativeResolution} onChange={event => setNarrativeResolution(event.target.value as typeof narrativeResolution)} className="mt-1 w-full rounded border p-2">{RESOLUTION_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        </div>
         <div className="flex gap-2"><button disabled={loading || !idea.trim()} onClick={() => void createStoryboard()} className="rounded bg-gray-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"><Pencil className="mr-2 inline h-4 w-4" />Create storyboard</button>{storyboardLoading && <button onClick={cancelStoryboard} className="rounded border border-gray-400 px-4 py-2 text-sm font-medium">Cancel</button>}</div>
         <label className="block pt-3 text-sm font-medium">Approved storyboard JSON</label>
         <textarea value={draft} onChange={event => setDraft(event.target.value)} className="h-[28rem] w-full rounded border p-3 font-mono text-xs" placeholder="The reviewed storyboard appears here before any images are generated." />
+        {effectiveCreativeIntent.length > 0 && <div className="rounded border bg-gray-50 p-3 text-sm"><div className="font-medium">Effective creative intent</div><div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-gray-700">{effectiveCreativeIntent.map(item => <span key={item.label}>{item.label}: {item.value}{item.source === 'user_selection' ? ' (selected)' : item.source === 'planner_inference' ? ' (Planner inferred)' : ''}</span>)}</div></div>}
         <div className="space-y-2 rounded border bg-gray-50 p-3 text-sm"><div className="font-medium">Publication format: Paged Comic</div><div className="grid gap-2 sm:grid-cols-2"><label>Layout selection<select value={layoutMode} onChange={event => setLayoutMode(event.target.value as LayoutMode)} className="mt-1 w-full rounded border p-2"><option value="auto">Auto</option><option value="simple">Simple</option><option value="manual">Manual</option></select></label><label>Image fit<select value={imageFit} onChange={event => setImageFit(event.target.value as 'cover' | 'contain')} className="mt-1 w-full rounded border p-2"><option value="cover">Cover / crop</option><option value="contain">Contain / preserve image</option></select></label></div>{layoutMode === 'manual' && storyboardPages.map(page => { const options = layouts[String(page.count)] || []; const value = pageLayouts[String(page.number)] || options[0] || ''; return <label key={page.number} className="block">Page {page.number} ({page.count} panels)<select value={value} onChange={event => setPageLayouts(previous => ({ ...previous, [String(page.number)]: event.target.value }))} className="mt-1 w-full rounded border p-2"><option value="">Select compatible layout</option>{options.map(layout => <option key={layout} value={layout}>{layout.replace(/^paged_/, '').replaceAll('_', ' ')}</option>)}</select></label> })}</div>
       </section>
       <section className="space-y-4 rounded-lg border bg-white p-5 shadow-sm">

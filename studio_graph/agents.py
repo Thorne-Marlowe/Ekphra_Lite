@@ -1,7 +1,13 @@
 import json
+from copy import deepcopy
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from .state import StudioState
+from .narrative_contract import (
+    attach_creative_intent_metadata,
+    resolve_creative_intent,
+    resolved_creative_intent_metadata,
+)
 from .prompts import (
     ART_DIRECTOR_HUMAN_PROMPT,
     ART_DIRECTOR_SYSTEM_PROMPT,
@@ -18,8 +24,11 @@ from .structured_output import (
     STORYBOARD_SCHEMA,
     STORY_PLAN_SCHEMA,
     create_structured_llm,
+    validate_story_plan_contract,
+    validate_storyboard_contract,
 )
 from .validation import validate_storyboard_structure
+from policy.adult_only import adult_only_errors
 import os
 import base64
 import logging
@@ -32,6 +41,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+_DEBUG_STORYBOARD_CAPTURE_DIR = Path(".ekphra-debug") / "storyboard"
 
 base_url = os.getenv("OPENAI_BASE_URL")
 if not base_url:
@@ -64,15 +74,223 @@ def parse_json_content(content) -> dict:
         raise
 
 
+def _capture_intermediate_plan(state: StudioState, artifact_name: str, payload: dict) -> None:
+    """Optionally save parsed Planner/Dialogue output for local development diagnosis.
+
+    This is deliberately opt-in so private story text is neither logged nor
+    retained during ordinary generation. It never affects graph routing.
+    """
+    if os.getenv("EKPHRA_CAPTURE_STORYBOARD_PLANS", "").strip().lower() not in {"1", "true", "yes"}:
+        return
+    generation_id = str(state.get("generation_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", generation_id):
+        logger.warning("Skipping storyboard debug capture because generation_id is invalid.")
+        return
+    target_dir = _DEBUG_STORYBOARD_CAPTURE_DIR / generation_id
+    target = target_dir / f"{artifact_name}.json"
+    temporary = target.with_suffix(".tmp")
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(target)
+    except OSError as exc:
+        logger.warning("Unable to write storyboard debug capture %s: %s", artifact_name, exc)
+
+
+def _normalize_story_plan_action_metadata(story_plan: dict) -> list[str]:
+    """Normalize the legacy plural action alias at the Planner boundary.
+
+    Renderable panels intentionally support one drawable ``required_action``.
+    A legacy plural value is safe only when it expresses exactly one nonblank
+    action.  More than one action requires an expanded data contract, so it is
+    rejected here before unchanged Planner data can trigger Artist retries.
+    """
+    errors: list[str] = []
+    beats = story_plan.get("beats") if isinstance(story_plan, dict) else None
+    if not isinstance(beats, list):
+        return errors  # Canonical schema validation owns the collection error.
+    for beat_index, beat in enumerate(beats, start=1):
+        if not isinstance(beat, dict):
+            continue  # Canonical schema validation owns this broader error.
+        if "required_action" in beat:
+            # The canonical spelling is authoritative, even when a legacy
+            # alias is also present. Remove the ignored alias deterministically.
+            beat.pop("required_actions", None)
+            continue
+        if "required_actions" not in beat:
+            continue
+        plural_actions = beat["required_actions"]
+        if (
+            isinstance(plural_actions, list)
+            and len(plural_actions) == 1
+            and isinstance(plural_actions[0], str)
+            and plural_actions[0].strip()
+        ):
+            beat["required_action"] = plural_actions[0].strip()
+            beat.pop("required_actions", None)
+            continue
+        if isinstance(plural_actions, list) and len(plural_actions) > 1:
+            errors.append(
+                f"beats[{beat_index}].required_actions: Multiple actions cannot be represented by the current "
+                "singular required_action contract."
+            )
+        else:
+            errors.append(
+                f"beats[{beat_index}].required_actions: Must contain exactly one non-empty string."
+            )
+    return errors
+
+
+def _normalize_and_validate_story_plan(story_plan: dict) -> list[str]:
+    """Apply the legacy action alias, then enforce the canonical Planner schema.
+
+    Invalid aliases remain visible in the captured raw plan but are omitted from
+    the validation copy so callers receive the more specific compatibility
+    diagnostic instead of a redundant unknown-field error.
+    """
+    errors = _normalize_story_plan_action_metadata(story_plan)
+    validation_plan = story_plan
+    if errors and isinstance(story_plan, dict):
+        validation_plan = deepcopy(story_plan)
+        beats = validation_plan.get("beats")
+        if isinstance(beats, list):
+            for beat in beats:
+                if isinstance(beat, dict):
+                    beat.pop("required_actions", None)
+    errors.extend(validate_story_plan_contract(validation_plan))
+    return list(dict.fromkeys(errors))
+
+
+def _reject_stage_adult_only_content(
+    state: StudioState,
+    *,
+    payload: dict,
+    stage_name: str,
+    path: str,
+) -> bool:
+    """Reject prohibited upstream content before it becomes immutable input.
+
+    The creative graph has no Planner- or Dialogue-stage retry edge.  Failing
+    at the owning stage is therefore safer than asking the Storyboard Artist
+    to repair content that constraint and dialogue merging will restore.
+    """
+    errors = adult_only_errors(payload, path)
+    if not errors:
+        return False
+    state["validation_errors"] = errors
+    state["generation_error"] = f"{stage_name} adult-only policy error: " + " | ".join(errors)
+    state["next_step"] = "failed"
+    logger.warning("%s output rejected by adult-only policy: %s", stage_name, " | ".join(errors))
+    return True
+
+
 def _panel_number(value) -> int:
-    """Accept either a numeric beat or a schema panel id from the dialogue LLM."""
+    """Return only a positive integer or digit-only global panel reference."""
+    if isinstance(value, bool):
+        return 0
     if isinstance(value, int):
-        return value
-    text = str(value or "").strip()
-    if text.isdigit():
-        return int(text)
-    match = re.search(r"(?:panel[_ -]*)?(?:\d+[_ -]+)?(\d+)$", text, re.IGNORECASE)
-    return int(match.group(1)) if match else 0
+        return value if value > 0 else 0
+    if isinstance(value, str):
+        text = value.strip()
+        return int(text) if text.isdigit() and int(text) > 0 else 0
+    return 0
+
+
+def _panel_reference_lookup(schema: dict, errors: list[str]) -> tuple[dict[str, str], dict[int, str]]:
+    """Build exact-ID and actual reading-order panel references.
+
+    Numeric Planner and Dialogue Writer references mean a one-based global
+    reading-order index.  This replaces the old fixed six-panel page stride,
+    which silently misrouted valid variable-panel-count pages.  Exact final
+    panel IDs remain supported for callers that can provide them.
+    """
+    by_id: dict[str, str] = {}
+    by_order: dict[int, str] = {}
+    order = 0
+    for page in schema.get("pages", []):
+        if not isinstance(page, dict):
+            continue
+        for panel in page.get("panels", []):
+            if not isinstance(panel, dict):
+                continue
+            panel_id = str(panel.get("id", "")).strip()
+            if not panel_id:
+                continue
+            if panel_id in by_id:
+                errors.append(f"Panel reference '{panel_id}' is ambiguous because panel IDs must be unique.")
+                continue
+            order += 1
+            by_id[panel_id] = panel_id
+            by_order[order] = panel_id
+    return by_id, by_order
+
+
+def _storyboard_character_ids(schema: dict) -> list[str]:
+    """Return registry IDs for retry diagnostics without recording story content."""
+    characters = schema.get("characters", {}) if isinstance(schema, dict) else {}
+    if not isinstance(characters, dict):
+        return []
+    return [str(character_id) for character_id in characters if str(character_id).strip()]
+
+
+def _planner_character_ids(story_plan: dict) -> list[str]:
+    """Return the ordered, non-empty IDs authored by the Story Planner."""
+    characters = story_plan.get("characters", []) if isinstance(story_plan, dict) else []
+    if not isinstance(characters, list):
+        return []
+    return list(dict.fromkeys(
+        str(character.get("id")).strip()
+        for character in characters
+        if isinstance(character, dict) and str(character.get("id", "")).strip()
+    ))
+
+
+def _record_storyboard_attempt_diagnostic(
+    state: StudioState,
+    *,
+    stage: str,
+    errors: list[str],
+    registry_ids: list[str] | None = None,
+) -> None:
+    """Keep concise, internal retry evidence without storing prompt/story text."""
+    entry = {
+        "attempt": int(state.get("retry_count", 0)) + 1,
+        "stage": stage,
+        "errors": list(errors),
+        "character_registry_ids": list(registry_ids or []),
+    }
+    state.setdefault("storyboard_attempt_diagnostics", []).append(entry)
+    logger.info(
+        "Storyboard attempt %(attempt)s failed during %(stage)s; registry IDs=%(character_registry_ids)s; errors=%(errors)s",
+        entry,
+    )
+
+
+def _resolve_panel_reference(
+    value,
+    *,
+    by_id: dict[str, str],
+    by_order: dict[int, str],
+    source: str,
+    errors: list[str],
+) -> str | None:
+    """Resolve one exact ID or global index without guessing a page stride."""
+    if isinstance(value, bool):
+        errors.append(f"{source} must use an exact panel ID or a positive global panel index.")
+        return None
+    text = value.strip() if isinstance(value, str) else str(value or "").strip()
+    if text in by_id:
+        return by_id[text]
+    number = _panel_number(value)
+    if number and number in by_order:
+        return by_order[number]
+    if not text:
+        errors.append(f"{source} is missing a panel reference.")
+    else:
+        errors.append(
+            f"{source} references '{text}', which is not an exact panel ID or a global panel index from 1 to {len(by_order)}."
+        )
+    return None
 
 
 def _character_identity(value) -> str:
@@ -136,43 +354,54 @@ def normalize_dialogue_plan_character_ids(
             candidates = aliases.get(_character_identity(reference_text), set())
             if len(candidates) == 1:
                 resolved = next(iter(candidates))
-        if resolved and resolved != reference_text:
+        if resolved:
             item["character_id"] = resolved
             item.pop("character", None)
-            notes.append(f"Normalized dialogue character ID '{reference_text}' to canonical ID '{resolved}'.")
+            if resolved != reference_text or reference != resolved:
+                notes.append(f"Normalized dialogue character ID '{reference_text}' to canonical ID '{resolved}'.")
         normalized.append(item)
     return normalized, notes
 
 
-def merge_approved_dialogues(schema: dict, dialogue_plan: dict, story_plan: dict) -> list[str]:
+def merge_approved_dialogues(
+    schema: dict,
+    dialogue_plan: dict,
+    story_plan: dict,
+    errors: list[str] | None = None,
+) -> list[str]:
     """Copy approved dialogue into final panels using canonical character IDs."""
     approved, normalization_notes = normalize_dialogue_plan_character_ids(
         dialogue_plan,
         schema.get("characters", {}),
         story_plan,
     )
-    by_panel: dict[int, list[dict]] = {}
-    for item in approved:
+    mapping_errors = errors if errors is not None else []
+    by_id, by_order = _panel_reference_lookup(schema, mapping_errors)
+    by_panel: dict[str, list[dict]] = {}
+    for dialogue_index, item in enumerate(approved, start=1):
         if not isinstance(item, dict):
             continue
-        panel_number = _panel_number(item.get("panel", 0))
         character_id = item.get("character_id") or item.get("character")
-        if panel_number > 0 and character_id and item.get("text"):
-            by_panel.setdefault(panel_number, []).append({
+        panel_id = _resolve_panel_reference(
+            item.get("panel"), by_id=by_id, by_order=by_order,
+            source=f"Dialogue {dialogue_index}", errors=mapping_errors,
+        )
+        if panel_id and character_id and item.get("text"):
+            by_panel.setdefault(panel_id, []).append({
                 "character_id": character_id,
                 "text": item["text"],
                 "emotion": item.get("emotion", "neutral"),
             })
     for page in schema.get("pages", []):
-        for index, panel in enumerate(page.get("panels", []), start=1):
-            panel_number = (int(page.get("page_number", 1)) - 1) * 6 + index
+        for panel in page.get("panels", []):
+            panel_id = str(panel.get("id", "")).strip()
             # The dialogue plan is authoritative, including an explicit empty
             # list for an intentional silent beat.
-            panel["dialogues"] = by_panel.get(panel_number, [])
+            panel["dialogues"] = by_panel.get(panel_id, [])
     return normalization_notes
 
 
-def _apply_story_constraints(schema: dict, story_plan: dict) -> None:
+def _apply_story_constraints(schema: dict, story_plan: dict, errors: list[str] | None = None) -> None:
     """Copy authored beat constraints into each renderable panel.
 
     The planner already produces structured subjects/actions/props.  Keeping
@@ -180,43 +409,73 @@ def _apply_story_constraints(schema: dict, story_plan: dict) -> None:
     accidentally reducing a concrete beat to a vague prose prompt.  No
     object, character, or keyword is inferred here.
     """
+    mapping_errors = errors if errors is not None else []
+    by_id, by_order = _panel_reference_lookup(schema, mapping_errors)
     beats = story_plan.get("beats", []) if isinstance(story_plan, dict) else []
-    by_panel = {
-        _panel_number(beat.get("panel")): beat
-        for beat in beats
-        if isinstance(beat, dict) and _panel_number(beat.get("panel")) > 0
-    }
+    by_panel: dict[str, dict] = {}
+    for beat_index, beat in enumerate(beats, start=1):
+        if not isinstance(beat, dict):
+            mapping_errors.append(f"Story plan beat {beat_index} must be an object.")
+            continue
+        panel_id = _resolve_panel_reference(
+            beat.get("panel"), by_id=by_id, by_order=by_order,
+            source=f"Story plan beat {beat_index}", errors=mapping_errors,
+        )
+        if not panel_id:
+            continue
+        if panel_id in by_panel:
+            mapping_errors.append(f"Story plan contains multiple beats for panel '{panel_id}'.")
+            continue
+        by_panel[panel_id] = beat
     for page in schema.get("pages", []):
-        page_number = int(page.get("page_number", 1) or 1)
-        for index, panel in enumerate(page.get("panels", []), start=1):
-            number = (page_number - 1) * 6 + index
-            beat = by_panel.get(number)
+        for panel in page.get("panels", []):
+            panel_id = str(panel.get("id", "")).strip()
+            beat = by_panel.get(panel_id)
             if not beat:
                 continue
             for field in ("primary_subject", "secondary_subject", "visual_hierarchy", "required_action"):
-                value = beat.get(field)
-                if value:
-                    panel[field] = value
+                if field not in beat:
+                    continue
+                value = beat[field]
+                if field == "visual_hierarchy" and isinstance(value, list) and all(isinstance(item, str) for item in value):
+                    panel[field] = list(value)
+                elif isinstance(value, str):
+                    # An explicitly empty scalar is valid and intentionally
+                    # overrides an artist-added value; omission does not.
+                    panel[field] = value.strip()
+                else:
+                    mapping_errors.append(f"Story plan beat for panel '{panel_id}' {field} must be a string.")
             for field in ("required_subjects", "required_props", "required_text"):
-                value = beat.get(field)
-                if isinstance(value, dict):
+                if field not in beat:
+                    continue
+                value = beat[field]
+                if field == "required_subjects" and isinstance(value, dict):
                     # Accept the structured hierarchy form without copying its
                     # field names into the visual contract.
                     value = [value.get("primary"), value.get("secondary")] if field == "required_subjects" else list(value.values())
-                elif isinstance(value, (str, int, float)):
+                elif isinstance(value, str):
                     value = [value]
-                if isinstance(value, (list, tuple, set)):
-                    placeholders = {"none", "null", "n/a", "na", "unknown", "not applicable"}
-                    panel[field] = list(dict.fromkeys(
-                        text for item in value
-                        if (text := str(item).strip()) and text.casefold() not in placeholders
-                    ))
+                if not isinstance(value, (list, tuple, set)):
+                    mapping_errors.append(f"Story plan beat for panel '{panel_id}' {field} must be an array of strings.")
+                    continue
+                if not all(isinstance(item, str) for item in value):
+                    mapping_errors.append(f"Story plan beat for panel '{panel_id}' {field} must contain only strings.")
+                    continue
+                placeholders = {"none", "null", "n/a", "na", "unknown", "not applicable"}
+                # Explicit [] remains []; missing fields above leave artist
+                # metadata untouched until renderer-compatible final defaults.
+                panel[field] = list(dict.fromkeys(
+                    text for item in value
+                    if (text := item.strip()) and text.casefold() not in placeholders
+                ))
 
 
-def _normalize_panel_schema(schema: dict) -> None:
+def _normalize_panel_schema(schema: dict, errors: list[str] | None = None) -> None:
     """Ensure every render panel carries the fields needed by the renderer/QA."""
-    for page in schema.get("pages", []):
-        for panel in page.get("panels", []):
+    normalization_errors = errors if errors is not None else []
+    for page_index, page in enumerate(schema.get("pages", []), start=1):
+        for panel_index, panel in enumerate(page.get("panels", []), start=1):
+            label = f"Page {page_index}, panel {panel_index}"
             subjects = panel.get("required_subjects", [])
             # Some model responses use the structured subject hierarchy object
             # in this field even though the render schema expects a list.  Do
@@ -229,17 +488,46 @@ def _normalize_panel_schema(schema: dict) -> None:
                     subjects.get("secondary"),
                 ]
                 subjects = [item for item in ordered if item]
-            if not isinstance(subjects, list):
-                subjects = [subjects] if subjects else []
+            elif isinstance(subjects, str):
+                subjects = [subjects]
+            elif not isinstance(subjects, list):
+                normalization_errors.append(f"{label} required_subjects must be an array of strings.")
+                subjects = []
+            if not all(isinstance(item, str) for item in subjects):
+                normalization_errors.append(f"{label} required_subjects must contain only strings.")
+                subjects = []
             panel["required_subjects"] = list(dict.fromkeys(
-                str(item).strip() for item in subjects if str(item).strip()
+                item.strip() for item in subjects if item.strip()
             ))
-            panel.setdefault("required_props", [])
-            panel.setdefault("required_text", [])
-            panel.setdefault("primary_subject", "")
-            panel.setdefault("secondary_subject", "")
-            panel.setdefault("visual_hierarchy", "")
-            panel.setdefault("required_action", "")
+            for field in ("required_props", "required_text"):
+                if field not in panel:
+                    panel[field] = []
+                    continue
+                value = panel[field]
+                if isinstance(value, str):
+                    value = [value]
+                if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                    normalization_errors.append(f"{label} {field} must be an array of strings.")
+                    panel[field] = []
+                    continue
+                panel[field] = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+            for field in ("primary_subject", "secondary_subject", "required_action"):
+                if field not in panel:
+                    panel[field] = ""
+                elif isinstance(panel[field], str):
+                    panel[field] = panel[field].strip()
+                else:
+                    normalization_errors.append(f"{label} {field} must be a string.")
+                    panel[field] = ""
+            if "visual_hierarchy" not in panel:
+                panel["visual_hierarchy"] = ""
+            elif isinstance(panel["visual_hierarchy"], str):
+                panel["visual_hierarchy"] = panel["visual_hierarchy"].strip()
+            elif isinstance(panel["visual_hierarchy"], list) and all(isinstance(item, str) for item in panel["visual_hierarchy"]):
+                panel["visual_hierarchy"] = [item.strip() for item in panel["visual_hierarchy"] if item.strip()]
+            else:
+                normalization_errors.append(f"{label} visual_hierarchy must be a string or an array of strings.")
+                panel["visual_hierarchy"] = ""
 
 
 def _enforce_vision_gate(review: dict, expected_panel_ids: set[str] | None = None) -> dict:
@@ -303,9 +591,46 @@ def _enforce_vision_gate(review: dict, expected_panel_ids: set[str] | None = Non
 
 def run_story_planner(state: StudioState) -> StudioState:
     prompt = ChatPromptTemplate.from_messages([("system", STORY_PLANNER_SYSTEM_PROMPT), ("human", STORY_PLANNER_HUMAN_PROMPT)])
-    result = (prompt | story_planner_llm).invoke({"idea": state["user_prompt"], "pages": state.get("pageCount", 1)})
+    result = (prompt | story_planner_llm).invoke({
+        "idea": state["user_prompt"],
+        "pages": state.get("pageCount", 1),
+        "creative_intent": json.dumps(state.get("requested_creative_intent", {}), ensure_ascii=False),
+    })
     try:
         state["story_plan"] = parse_json_content(result.content)
+        _capture_intermediate_plan(state, "story_plan", state["story_plan"])
+        planner_errors = _normalize_and_validate_story_plan(state["story_plan"])
+        if planner_errors:
+            state["validation_errors"] = planner_errors
+            state["generation_error"] = "Story Planner contract error: " + " | ".join(planner_errors)
+            state["next_step"] = "failed"
+            _record_storyboard_attempt_diagnostic(
+                state,
+                stage="planner_contract",
+                errors=planner_errors,
+                registry_ids=_planner_character_ids(state["story_plan"]),
+            )
+            return state
+        if _reject_stage_adult_only_content(
+            state,
+            payload=state["story_plan"],
+            stage_name="Story Planner",
+            path="story_plan",
+        ):
+            return state
+        (
+            requested_intent,
+            inferred_intent,
+            effective_intent,
+            intent_sources,
+        ) = resolve_creative_intent(
+            state.get("requested_creative_intent"),
+            state["story_plan"].get("creative_intent"),
+        )
+        state["requested_creative_intent"] = requested_intent
+        state["inferred_creative_intent"] = inferred_intent
+        state["effective_creative_intent"] = effective_intent
+        state["creative_intent_sources"] = intent_sources
         # Keep the language selected by the planner as an explicit state value;
         # dialogue generation must not infer it from names or location.
         language = str(state["story_plan"].get("language", "")).strip()
@@ -473,9 +798,18 @@ def run_dialogue_writer(state: StudioState) -> StudioState:
         "plan": json.dumps(state.get("story_plan", {}), ensure_ascii=False),
         "language": state.get("requested_language") or state.get("story_plan", {}).get("language", "English"),
         "corrections": json.dumps(state.get("story_plan", {}).get("vision_corrections", []), ensure_ascii=False),
+        "creative_intent": json.dumps(state.get("effective_creative_intent", {}), ensure_ascii=False),
     })
     try:
         state["dialogue_plan"] = parse_json_content(result.content)
+        _capture_intermediate_plan(state, "dialogue_plan", state["dialogue_plan"])
+        if _reject_stage_adult_only_content(
+            state,
+            payload=state["dialogue_plan"],
+            stage_name="Dialogue Writer",
+            path="dialogue_plan",
+        ):
+            return state
         state["validation_errors"] = []
         state["next_step"] = "storyboarder"
     except Exception as exc:
@@ -499,19 +833,42 @@ def run_storyboarder(state: StudioState) -> StudioState:
     ])
     
     chain = prompt | storyboarder_llm
+    approved_character_ids = _planner_character_ids(state.get("story_plan", {}))
     res = chain.invoke({
         "prompt": state["user_prompt"],
         "draft": json.dumps(state.get("current_schema", {}), ensure_ascii=False),
         "fixes": "\n".join(state.get("validation_errors", [])),
         "story_plan": json.dumps(state.get("story_plan", {}), ensure_ascii=False),
         "dialogue_plan": json.dumps(state.get("dialogue_plan", {}), ensure_ascii=False),
+        "creative_intent": json.dumps(state.get("effective_creative_intent", {}), ensure_ascii=False),
         "vision_corrections": json.dumps(state.get("story_plan", {}).get("vision_corrections", []), ensure_ascii=False),
+        "approved_character_ids": json.dumps(approved_character_ids, ensure_ascii=False),
     })
     
     try:
         schema = parse_json_content(res.content)
-        _apply_story_constraints(schema, state.get("story_plan", {}))
-        _normalize_panel_schema(schema)
+        structural_errors = validate_storyboard_contract(schema)
+        if structural_errors:
+            state["validation_errors"] = structural_errors
+            _record_storyboard_attempt_diagnostic(
+                state, stage="schema_validation", errors=structural_errors,
+                registry_ids=_storyboard_character_ids(schema),
+            )
+            return state
+        _apply_story_constraints(schema, state.get("story_plan", {}), structural_errors)
+        _normalize_panel_schema(schema, structural_errors)
+        # This phase records only user selections and actual known inference;
+        # it intentionally does not alter prompts or fabricate Planner intent.
+        attach_creative_intent_metadata(
+            schema,
+            resolved_creative_intent_metadata(
+                state.get("requested_creative_intent"),
+                state.get("inferred_creative_intent"),
+                state.get("effective_creative_intent"),
+                state.get("creative_intent_sources"),
+                state.get("creative_intent_warnings"),
+            ),
+        )
         # Character cards are immutable across validator/Vision retries.  A
         # fresh storyboard draft must not silently replace the registered cast.
         previous_characters = state.get("current_schema", {}).get("characters", {})
@@ -521,7 +878,6 @@ def run_storyboarder(state: StudioState) -> StudioState:
         allowed_ids = set(previous_characters.keys()) if previous_characters else registered_ids
         # Keep only registered cast IDs in every panel. Structured subject fields
         # remain available for stories that legitimately need groups/backgrounds.
-        structural_errors: list[str] = []
         for page in schema.get("pages", []):
             for panel in page.get("panels", []):
                 active = panel.get("active_char_ids", []) or []
@@ -538,6 +894,10 @@ def run_storyboarder(state: StudioState) -> StudioState:
                 # source of truth; arbitrary prompt wording must remain free.
         if structural_errors:
             state["validation_errors"] = structural_errors
+            _record_storyboard_attempt_diagnostic(
+                state, stage="normalization", errors=structural_errors,
+                registry_ids=_storyboard_character_ids(schema),
+            )
             return state
         # Dialogue is approved upstream. Do not let the storyboard model
         # silently rewrite it while converting the plan into render JSON.
@@ -545,7 +905,15 @@ def run_storyboarder(state: StudioState) -> StudioState:
             schema,
             state.get("dialogue_plan", {}),
             state.get("story_plan", {}),
+            structural_errors,
         )
+        if structural_errors:
+            state["validation_errors"] = structural_errors
+            _record_storyboard_attempt_diagnostic(
+                state, stage="dialogue_merge", errors=structural_errors,
+                registry_ids=_storyboard_character_ids(schema),
+            )
+            return state
         state["normalization_notes"] = normalization_notes
         for note in normalization_notes:
             logger.info("Storyboard accepted with safe normalization: %s", note)
@@ -553,6 +921,9 @@ def run_storyboarder(state: StudioState) -> StudioState:
         state["validation_errors"] = []
     except Exception as e:
         state["validation_errors"] = [f"JSON Parse Error: {e}"]
+        _record_storyboard_attempt_diagnostic(
+            state, stage="parsing", errors=state["validation_errors"], registry_ids=[],
+        )
         
     return state
 
@@ -574,6 +945,12 @@ def run_validator(state: StudioState) -> StudioState:
     errors = list(state.get("validation_errors", [])) + structural_errors
     if errors:
         state["validation_errors"] = list(dict.fromkeys(errors))
+        _record_storyboard_attempt_diagnostic(
+            state,
+            stage="structural_validation",
+            errors=state["validation_errors"],
+            registry_ids=_storyboard_character_ids(state.get("current_schema", {})),
+        )
         logger.warning(
             "Storyboard generation attempt %s (retry limit %s) rejected: %s",
             attempt,

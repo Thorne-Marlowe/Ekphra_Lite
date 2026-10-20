@@ -28,6 +28,7 @@ models/
 
 # Generated outputs
 outputs/
+.ekphra-debug/
 
 # Temporary files
 *.log
@@ -39,3 +40,6 @@ Thumbs.db
 
 # Local renderer configuration
 renderer_profiles.json
+
+# Generated font conversion cache
+assets/fonts/.cache/

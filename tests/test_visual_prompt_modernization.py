@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,8 +10,10 @@ os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
 
 from langchain_core.runnables import RunnableLambda
 from panel_engine.comfy_renderer import build_panel_prompt
-from studio_graph.agents import merge_approved_dialogues, run_storyboarder
-from studio_graph.prompts import STORYBOARDER_SYSTEM_PROMPT
+from studio_graph.agents import _normalize_panel_schema, merge_approved_dialogues, run_storyboarder
+from studio_graph.prompts import STORYBOARDER_SYSTEM_PROMPT, build_storyboarder_human_prompt
+from studio_graph.structured_output import STORYBOARD_SCHEMA
+from studio_graph.validation import validate_storyboard_structure
 from utils.parser import load_comic_from_json
 
 
@@ -22,6 +25,39 @@ class VisualPromptModernizationTests(unittest.TestCase):
 
     def test_storyboard_instructions_allow_brief_temporal_context(self):
         self.assertIn("Brief temporal context is allowed", STORYBOARDER_SYSTEM_PROMPT)
+
+    def test_storyboard_artist_has_visual_adapter_role_and_preserves_approved_authority(self):
+        prompt = build_storyboarder_human_prompt(page_count=1, has_previous_draft=False)
+
+        self.assertIn("sole responsibility is to translate the approved Story Planner beats", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertNotIn("Sole Creator", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertNotIn("must write the story and the dialogue yourself", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertNotIn("COMEDIC FORMULAS (YOU MUST STRICTLY USE", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertIn("approved story plan controls narrative events, cast, beat intent", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertIn("approved dialogue plan controls dialogue text, speaker IDs, and panel assignments", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertIn("positive requirements, not exhaustive lists", STORYBOARDER_SYSTEM_PROMPT)
+        self.assertIn("Use the approved story plan and dialogue plan below", prompt)
+
+    def test_storyboard_example_is_valid_json_with_compatible_metadata_shapes(self):
+        example = re.search(r"```json\n(.*?)\n```", STORYBOARDER_SYSTEM_PROMPT, re.DOTALL)
+        self.assertIsNotNone(example)
+        # ChatPromptTemplate uses f-string syntax. Escaped source braces render
+        # as ordinary JSON braces in the model-facing system prompt.
+        schema = json.loads(example.group(1).replace("{{", "{").replace("}}", "}"))
+        panel = schema["pages"][0]["panels"][0]
+
+        self.assertEqual(validate_storyboard_structure(schema, 1), [])
+        panel_properties = STORYBOARD_SCHEMA["properties"]["pages"]["items"]["properties"]["panels"]["items"]["properties"]
+        self.assertTrue(all(field in panel for field in (
+            "primary_subject", "secondary_subject", "visual_hierarchy", "required_subjects",
+            "required_action", "required_props", "required_text", "character_actions",
+        )))
+        self.assertIn("character_positions", panel_properties)
+        _normalize_panel_schema(schema)
+        self.assertEqual(panel["required_props"], ["green slime", "crooked NO ENTRY sign"])
+        self.assertEqual(panel["required_text"], ["NO ENTRY"])
+        self.assertIn("NO ENTRY sign", panel["panel_prompt_en"])
+        self.assertEqual(panel["character_actions"]["char_dad"]["objects"], ["green slime"])
 
     def test_final_prompt_preserves_identity_props_camera_and_meaningful_hierarchy(self):
         comic, panel = self._comic({
@@ -181,6 +217,29 @@ class VisualPromptModernizationTests(unittest.TestCase):
         panel = schema["pages"][0]["panels"][0]
         self.assertEqual(panel["panel_prompt_en"], "Nyx studies a map")
         self.assertEqual(panel["dialogues"][0]["text"], "This route is wrong.")
+
+    def test_mocked_storyboard_artist_cannot_replace_approved_dialogue(self):
+        artist_schema = {
+            "characters": {"nyx": {"name": "Nyx", "base_prompt_en": "android"}},
+            "pages": [{"page_number": 1, "panels": [
+                {"id": "p1", "panel_prompt_en": "Nyx studies a map", "active_char_ids": ["nyx"],
+                 "dialogues": [{"character_id": "nyx", "text": "Artist replacement.", "emotion": "angry"}]},
+                {"id": "p2", "panel_prompt_en": "Nyx leaves the station", "active_char_ids": ["nyx"], "dialogues": []},
+            ]}],
+        }
+        state = {
+            "user_prompt": "Nyx misses a train.", "pageCount": 1, "current_schema": {}, "validation_errors": [],
+            "story_plan": {"characters": [{"id": "nyx", "name": "Nyx"}]},
+            "dialogue_plan": {"dialogues": [{"panel": 1, "character_id": "nyx", "text": "This route is wrong.", "emotion": "worried"}]},
+        }
+
+        with patch("studio_graph.agents.storyboarder_llm", RunnableLambda(lambda _: SimpleNamespace(content=json.dumps(artist_schema)))):
+            result = run_storyboarder(state)
+
+        dialogue = result["current_schema"]["pages"][0]["panels"][0]["dialogues"][0]
+        self.assertEqual(dialogue["text"], "This route is wrong.")
+        self.assertEqual(dialogue["character_id"], "nyx")
+        self.assertEqual(dialogue["emotion"], "worried")
 
     def test_storyboarder_preserves_temporal_context_without_a_retry_error(self):
         schema = {

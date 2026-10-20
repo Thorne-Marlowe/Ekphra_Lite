@@ -2,6 +2,30 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { StoryboardRequestController } from '../src/storyboardRequest.ts'
 import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from '../src/visionQa.ts'
+import { buildCreativeIntent, buildStoryboardRequest, effectiveCreativeIntentEntries } from '../src/creativeIntent.ts'
+
+test('creative controls default to an omitted intent and preserve explicit selections', () => {
+  assert.equal(buildCreativeIntent({ genre: '', tone: '', narrativeResolution: 'auto' }), undefined)
+  assert.deepEqual(buildCreativeIntent({ genre: 'mystery', tone: '', narrativeResolution: 'auto' }), { genre: 'mystery' })
+  assert.deepEqual(buildCreativeIntent({ genre: '', tone: 'serious', narrativeResolution: 'auto' }), { tone: 'serious' })
+  assert.deepEqual(buildCreativeIntent({ genre: '', tone: '', narrativeResolution: 'cliffhanger' }), { narrative_resolution: 'cliffhanger' })
+  assert.deepEqual(buildCreativeIntent({ genre: '', tone: 'suspenseful', narrativeResolution: 'revelation' }), {
+    tone: 'suspenseful', narrative_resolution: 'revelation',
+  })
+  assert.deepEqual(buildStoryboardRequest('A quiet scene.', 2, { genre: '', tone: '', narrativeResolution: 'auto' }), {
+    prompt: 'A quiet scene.', pageCount: 2,
+  })
+})
+
+test('effective creative intent display tolerates missing and partial storyboard metadata', () => {
+  assert.deepEqual(effectiveCreativeIntentEntries(undefined), [])
+  assert.deepEqual(effectiveCreativeIntentEntries({ effective: { genre: 'mystery', narrative_resolution: 'revelation' }, source: {
+    genre: 'user_selection', narrative_resolution: 'planner_inference',
+  } }), [
+    { label: 'Genre', value: 'mystery', source: 'user_selection' },
+    { label: 'Resolution', value: 'revelation', source: 'planner_inference' },
+  ])
+})
 
 test('cancellation aborts the active request and invalidates its result', () => {
   const requests = new StoryboardRequestController()

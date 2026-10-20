@@ -24,8 +24,18 @@ class StudioState(TypedDict):
     generation_error: str
     story_plan: dict
     dialogue_plan: dict
+    # Optional explicit selections and only actual Planner-derived values.
+    # Prompt integration is intentionally deferred; these fields establish
+    # deterministic provenance without changing creative behavior.
+    requested_creative_intent: dict
+    inferred_creative_intent: dict
+    effective_creative_intent: dict
+    creative_intent_sources: dict
+    creative_intent_warnings: List[dict]
     # Safe, deterministic cross-stage ID repairs applied to dialogue only.
     normalization_notes: List[str]
+    # Development diagnostics only; never returned as part of the public API.
+    storyboard_attempt_diagnostics: List[dict]
     vision_qa: dict
     # Optional creative-review text. It is informational and never controls
     # storyboard retry routing.

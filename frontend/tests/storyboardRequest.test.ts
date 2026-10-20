@@ -3,6 +3,7 @@ import test from 'node:test'
 import { StoryboardRequestController } from '../src/storyboardRequest.ts'
 import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from '../src/visionQa.ts'
 import { buildCreativeIntent, buildStoryboardRequest, effectiveCreativeIntentEntries } from '../src/creativeIntent.ts'
+import { buildArtDirection, resolvedArtDirection } from '../src/artDirection.ts'
 
 test('creative controls default to an omitted intent and preserve explicit selections', () => {
   assert.equal(buildCreativeIntent({ genre: '', tone: '', narrativeResolution: 'auto' }), undefined)
@@ -15,6 +16,22 @@ test('creative controls default to an omitted intent and preserve explicit selec
   assert.deepEqual(buildStoryboardRequest('A quiet scene.', 2, { genre: '', tone: '', narrativeResolution: 'auto' }), {
     prompt: 'A quiet scene.', pageCount: 2,
   })
+})
+
+test('art direction is omitted by default and serializes only selected values', () => {
+  assert.equal(buildArtDirection({ presetId: '', customPrompt: '  ' }), undefined)
+  assert.deepEqual(buildArtDirection({ presetId: 'black_and_white_manga', customPrompt: '' }), {
+    preset_id: 'black_and_white_manga',
+  })
+  assert.deepEqual(buildArtDirection({ presetId: '', customPrompt: ' ink wash ' }), { custom_prompt: 'ink wash' })
+  assert.deepEqual(buildStoryboardRequest('A scene.', 1, { genre: '', tone: '', narrativeResolution: 'auto' }, {
+    presetId: 'cinematic_graphic_novel', customPrompt: 'restrained texture',
+  }), {
+    prompt: 'A scene.', pageCount: 1,
+    artDirection: { preset_id: 'cinematic_graphic_novel', custom_prompt: 'restrained texture' },
+  })
+  assert.equal(resolvedArtDirection({ resolved_prompt: 'approved visual treatment' }), 'approved visual treatment')
+  assert.equal(resolvedArtDirection(undefined), null)
 })
 
 test('effective creative intent display tolerates missing and partial storyboard metadata', () => {

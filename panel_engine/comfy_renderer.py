@@ -16,6 +16,7 @@ from panel_engine.job_status import mark_completed, mark_failed, reserve_new_ren
 from page.builder import build_comic_page
 from page.layouts import compute_layout_placements, select_layout_name
 from policy.adult_only import validate_diffusion_prompts, validate_metadata_payload
+from style.presets import validated_storyboard_art_direction
 from utils.parser import Comic, Panel, load_comic_from_json
 
 
@@ -247,6 +248,7 @@ def build_panel_prompt(comic: Comic, panel: Panel) -> str:
         add("setting", panel.background_prompt_en)
     elif comic.background and comic.background.prompt_en:
         add("setting", comic.background.prompt_en)
+    add("art direction", validated_storyboard_art_direction(comic.metadata))
     return ". ".join(part.strip().rstrip(".") for part in parts if part and part.strip())
 
 

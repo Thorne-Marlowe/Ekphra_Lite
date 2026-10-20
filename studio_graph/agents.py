@@ -28,6 +28,7 @@ from .structured_output import (
     validate_storyboard_contract,
 )
 from .validation import validate_storyboard_structure
+from style.presets import ArtDirectionError
 from policy.adult_only import adult_only_errors
 import os
 import base64
@@ -877,6 +878,17 @@ def run_storyboarder(state: StudioState) -> StudioState:
                 state.get("creative_intent_warnings"),
             ),
         )
+        # Art direction is approved before the graph starts. It is not
+        # model-authored authority, so replace any Artist-supplied value.
+        metadata = schema.get("metadata")
+        if metadata is None:
+            metadata = {}
+            schema["metadata"] = metadata
+        if not isinstance(metadata, dict):
+            raise ArtDirectionError("storyboard metadata must be an object to store art direction")
+        metadata.pop("art_direction", None)
+        if state.get("approved_art_direction"):
+            metadata["art_direction"] = deepcopy(state["approved_art_direction"])
         # Character cards are immutable across validator/Vision retries.  A
         # fresh storyboard draft must not silently replace the registered cast.
         previous_characters = state.get("current_schema", {}).get("characters", {})

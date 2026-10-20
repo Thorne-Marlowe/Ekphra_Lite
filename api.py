@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from comfyui.client import ComfyUIClient, ComfyUIError
 from comfyui.profiles import ProfileError, RendererProfileStore
@@ -27,6 +27,7 @@ from studio_graph.narrative_contract import (
     NarrativeContractError,
     resolve_creative_intent,
 )
+from style.presets import ArtDirectionError, resolve_art_direction, validated_storyboard_art_direction
 from utils.parser import load_comic_from_json
 from vision_qa.engine import (
     CONFIDENCES,
@@ -52,10 +53,18 @@ app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 storyboard_graph = create_storyboard_graph()
 
 
+class ArtDirectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preset_id: str | None = None
+    custom_prompt: str | None = None
+
+
 class StoryboardRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10000)
     pageCount: int = Field(default=1, ge=1, le=8)
     creativeIntent: dict | None = None
+    artDirection: ArtDirectionRequest | None = None
 
 
 class RenderRequest(BaseModel):
@@ -281,6 +290,12 @@ async def create_storyboard(req: StoryboardRequest, request: Request):
         )
     except NarrativeContractError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        approved_art_direction = resolve_art_direction(
+            req.artDirection.model_dump() if req.artDirection is not None else None
+        )
+    except ArtDirectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     state = {
         "generation_id": uuid.uuid4().hex, "user_prompt": req.prompt, "requested_language": "",
         "current_schema": {}, "story_plan": {}, "dialogue_plan": {}, "normalization_notes": [], "vision_qa": {},
@@ -292,6 +307,7 @@ async def create_storyboard(req: StoryboardRequest, request: Request):
         "effective_creative_intent": effective_intent,
         "creative_intent_sources": intent_sources,
         "creative_intent_warnings": [],
+        "approved_art_direction": approved_art_direction or {},
     }
     try:
         final_state = await invoke_storyboard_graph(state, request)
@@ -320,6 +336,9 @@ async def render_storyboard(req: RenderRequest):
         raise HTTPException(status_code=422, detail="A storyboard JSON object is required before rendering.")
     try:
         load_comic_from_json(req.storyboard)
+        # Review JSON may contain a human-edited resolved prompt. Validate it
+        # before profile lookup, job reservation, or ComfyUI work begins.
+        validated_storyboard_art_direction(req.storyboard.get("metadata", {}))
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid storyboard JSON: {exc}") from exc
     profile = profile_or_422(req.rendererProfile)

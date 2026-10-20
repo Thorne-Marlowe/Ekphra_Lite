@@ -42,9 +42,11 @@ export function buildStoryboardRequest(
   prompt: string,
   pageCount: number,
   selection: CreativeIntentSelection,
-): { prompt: string; pageCount: number; creativeIntent?: Record<string, string> } {
+  artDirectionSelection: ArtDirectionSelection = { presetId: '', customPrompt: '' },
+): { prompt: string; pageCount: number; creativeIntent?: Record<string, string>; artDirection?: Record<string, string> } {
   const creativeIntent = buildCreativeIntent(selection)
-  return { prompt, pageCount, ...(creativeIntent ? { creativeIntent } : {}) }
+  const artDirection = buildArtDirection(artDirectionSelection)
+  return { prompt, pageCount, ...(creativeIntent ? { creativeIntent } : {}), ...(artDirection ? { artDirection } : {}) }
 }
 
 export function effectiveCreativeIntentEntries(value: unknown): Array<{ label: string; value: string; source?: string }> {
@@ -58,3 +60,5 @@ export function effectiveCreativeIntentEntries(value: unknown): Array<{ label: s
     return [{ label: labels[key], value: rawValue, source }]
   })
 }
+import { buildArtDirection } from './artDirection'
+import type { ArtDirectionSelection } from './artDirection'

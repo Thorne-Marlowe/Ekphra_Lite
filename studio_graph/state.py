@@ -32,6 +32,9 @@ class StudioState(TypedDict):
     effective_creative_intent: dict
     creative_intent_sources: dict
     creative_intent_warnings: List[dict]
+    # Resolved before graph execution; only deterministic postprocessing may
+    # attach it to the final approved storyboard.
+    approved_art_direction: dict
     # Safe, deterministic cross-stage ID repairs applied to dialogue only.
     normalization_notes: List[str]
     # Development diagnostics only; never returned as part of the public API.

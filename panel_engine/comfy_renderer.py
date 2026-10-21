@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +19,12 @@ from page.layouts import compute_layout_placements, select_layout_name
 from policy.adult_only import validate_diffusion_prompts, validate_metadata_payload
 from style.presets import validated_storyboard_art_direction
 from utils.parser import Comic, Panel, load_comic_from_json
+
+
+# RandomNoise accepts ComfyUI's unsigned 64-bit seed domain. The checked-in
+# workflow already uses a value larger than 32 bits, so do not narrow this to
+# a UI-era 32-bit range.
+MAX_RANDOM_NOISE_SEED = (1 << 64) - 1
 
 
 _LEGACY_CONTINUITY_PREFIX = "preserve the registered recurring cast and approved setting;"
@@ -289,6 +296,23 @@ def _profile_values(panel: Panel, prompt: str, width: int, height: int, settings
     return values
 
 
+def generate_random_seed() -> int:
+    return secrets.randbelow(MAX_RANDOM_NOISE_SEED + 1)
+
+
+def effective_panel_seed(settings: dict) -> int:
+    """Resolve one seed for one actual diffusion execution."""
+    mode = settings.get("seed_mode", "random")
+    if mode == "random":
+        return generate_random_seed()
+    if mode != "fixed":
+        raise ValueError("seed_mode must be random or fixed.")
+    seed = settings.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_RANDOM_NOISE_SEED:
+        raise ValueError(f"Fixed seed must be an integer from 0 to {MAX_RANDOM_NOISE_SEED}.")
+    return seed
+
+
 def render_panels_with_comfyui(
     schema_path: str | Path,
     output_panel_dir: str | Path,
@@ -307,6 +331,13 @@ def render_panels_with_comfyui(
     output_dir.mkdir(parents=True, exist_ok=True)
     panel_sizes = json.loads((schema_path.parent / "panel_sizes.json").read_text(encoding="utf-8")) \
         if (schema_path.parent / "panel_sizes.json").exists() else {}
+    seeds_path = schema_path.parent / "panel_seeds.json"
+    try:
+        panel_seeds = json.loads(seeds_path.read_text(encoding="utf-8")) if seeds_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        panel_seeds = {}
+    if not isinstance(panel_seeds, dict):
+        panel_seeds = {}
 
     for panel in comic.panels:
         if target_ids is not None and panel.id not in target_ids:
@@ -317,6 +348,7 @@ def render_panels_with_comfyui(
         width, height = select_panel_resolution(layout_width, layout_height)
         prompt = build_panel_prompt(comic, panel)
         values = _profile_values(panel, prompt, width, height, settings)
+        values["seed"] = effective_panel_seed(settings)
         bound_workflow = profile.apply_inputs(workflow, values)
         validate_diffusion_prompts(
             panel_id=panel.id,
@@ -332,6 +364,8 @@ def render_panels_with_comfyui(
         except Exception as exc:
             raise RuntimeError(f"ComfyUI returned an unreadable image for panel {panel.id}: {exc}") from exc
         image.save(output_dir / f"{panel.id}.png", format="PNG")
+        panel_seeds[panel.id] = values["seed"]
+        seeds_path.write_text(json.dumps(panel_seeds, indent=2), encoding="utf-8")
 
 
 def render_comic_schema(

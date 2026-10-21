@@ -4,26 +4,38 @@ import unittest
 from pathlib import Path
 
 from comfyui.client import ComfyUIClient
-from comfyui.profiles import RendererProfileStore
+from comfyui.profiles import ProfileError, RendererProfileStore
 
 
 class RendererProfileTests(unittest.TestCase):
     def test_klein_profile_binds_the_checked_in_api_workflow_prompt_and_output(self):
         root = Path(__file__).resolve().parents[1]
-        profile = RendererProfileStore(root / "renderer_profiles.json", root).get("flux2-klein-base-9b")
+        profile = RendererProfileStore(root / "renderer_profiles.example.json", root).get("flux2-klein-base-9b")
 
         workflow = profile.load_workflow(root)
         original_prompt = workflow["148"]["inputs"]["text"]
-        bound = profile.apply_inputs(workflow, {"positive_prompt": "a comic panel test prompt", "width": 832, "height": 1216})
+        bound = profile.apply_inputs(workflow, {
+            "positive_prompt": "a comic panel test prompt", "width": 832, "height": 1216,
+            "seed": 299955909870984,
+        })
 
         self.assertEqual(profile.output_node_id, "9")
         self.assertEqual(bound["148"]["inputs"]["text"], "a comic panel test prompt")
         self.assertEqual(bound["150"]["inputs"]["value"], 832)
         self.assertEqual(bound["151"]["inputs"]["value"], 1216)
+        self.assertEqual(bound["114"]["inputs"]["noise_seed"], 299955909870984)
         self.assertEqual(workflow["148"]["inputs"]["text"], original_prompt)
         self.assertEqual(bound["9"]["class_type"], "SaveImage")
         self.assertEqual(bound["144"]["inputs"]["unet_name"], workflow["144"]["inputs"]["unet_name"])
         self.assertEqual(bound["155"]["inputs"]["steps"], workflow["155"]["inputs"]["steps"])
+        self.assertEqual(bound["152"]["inputs"]["cfg"], workflow["152"]["inputs"]["cfg"])
+
+    def test_placeholder_profile_is_not_operational(self):
+        root = Path(__file__).resolve().parents[1]
+        profile = RendererProfileStore(root / "renderer_profiles.example.json", root).get("krea-2")
+        self.assertFalse(profile.available)
+        with self.assertRaisesRegex(ProfileError, "not available"):
+            profile.load_workflow(root)
 
     def test_profile_binds_declared_inputs_without_guessing_nodes(self):
         with tempfile.TemporaryDirectory() as directory:

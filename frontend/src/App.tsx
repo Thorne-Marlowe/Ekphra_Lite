@@ -4,11 +4,12 @@ import { StoryboardRequestController } from './storyboardRequest'
 import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from './visionQa'
 import { buildStoryboardRequest, effectiveCreativeIntentEntries, GENRE_OPTIONS, RESOLUTION_OPTIONS, TONE_OPTIONS } from './creativeIntent'
 import { ART_DIRECTION_PRESETS, resolvedArtDirection } from './artDirection'
+import { buildSeedSettings } from './renderSettings'
 
 type Dialogue = { character_id?: string; text?: string; emotion?: string }
 type PanelMeta = { id: string; x: number; y: number; width: number; height: number; prompt: string; dialogues: Dialogue[] }
 type PageMeta = { url: string; pageWidth: number; pageHeight: number; panels: PanelMeta[] }
-type Profile = { id: string; label: string; description: string }
+type Profile = { id: string; label: string; description: string; workflowControls?: { steps?: number; guidance?: number; seed?: boolean; negative_prompt?: boolean } }
 type LayoutMode = 'auto' | 'simple' | 'manual'
 type StoryboardPage = { number: number; count: number }
 type VisionQaObservation = { category: string; severity: string; confidence: string; explanation: string }
@@ -38,10 +39,8 @@ export default function App() {
   const [panelPrompt, setPanelPrompt] = useState('')
   const [dialogues, setDialogues] = useState('[]')
   const [editMode, setEditMode] = useState<'panel' | 'dialogue'>('panel')
-  const [steps, setSteps] = useState('')
-  const [guidance, setGuidance] = useState('')
-  const [negativePrompt, setNegativePrompt] = useState('')
-  const [seed, setSeed] = useState('')
+  const [seedPolicy, setSeedPolicy] = useState<'random' | 'fixed'>('random')
+  const [fixedSeed, setFixedSeed] = useState('')
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('auto')
   const [pageLayouts, setPageLayouts] = useState<Record<string, string>>({})
   const [imageFit, setImageFit] = useState<'cover' | 'contain'>('cover')
@@ -86,6 +85,8 @@ export default function App() {
   const approvedArtDirection = useMemo(() => {
     try { return resolvedArtDirection(JSON.parse(draft)?.metadata?.art_direction) } catch { return null }
   }, [draft])
+
+  const selectedProfile = useMemo(() => profiles.find(item => item.id === profile), [profiles, profile])
 
   const resolvedPageLayouts = () => Object.fromEntries(storyboardPages.map((page): [string, string] => {
     const options = layouts[String(page.count)] || []
@@ -172,11 +173,12 @@ export default function App() {
 
   const render = async () => {
     if (!profile) { setMessage('Select a renderer profile after configuring renderer_profiles.json.'); return }
+    let seedSettings
+    try { seedSettings = buildSeedSettings(seedPolicy, fixedSeed) } catch (error) { setMessage(`Render error: ${error}`); return }
     setLoading(true); setMessage('Submitting approved storyboard panels to ComfyUI…')
     try {
       const data = await api('/api/render-storyboard', {
-        storyboard: parseDraft(), rendererProfile: profile, steps: steps ? Number(steps) : null,
-        guidance: guidance ? Number(guidance) : null, negativePrompt, seed: seed ? Number(seed) : null,
+        storyboard: parseDraft(), rendererProfile: profile, ...seedSettings,
         publicationFormat: 'paged_comic', layoutMode, pageLayouts: layoutMode === 'manual' ? resolvedPageLayouts() : {}, imageFit,
       })
       const urls = data.pages.map((url: string) => `${API_BASE}${url}`)
@@ -223,12 +225,13 @@ export default function App() {
     if (!editing || !profile) return
     let parsedDialogues: Dialogue[]
     try { parsedDialogues = JSON.parse(dialogues); if (!Array.isArray(parsedDialogues)) throw new Error() } catch { setMessage('Dialogue must be a JSON array.'); return }
+    let seedSettings
+    try { seedSettings = buildSeedSettings(seedPolicy, fixedSeed) } catch (error) { setMessage(`Panel update error: ${error}`); return }
     setLoading(true)
     try {
       const data = await api('/api/regenerate-panel', {
         pageUrl: editing.pageUrl, panelId: editing.panel.id, panelPrompt, dialogues: parsedDialogues, mode: editMode,
-        rendererProfile: profile, steps: steps ? Number(steps) : null, guidance: guidance ? Number(guidance) : null,
-        negativePrompt, seed: seed ? Number(seed) : null,
+        rendererProfile: profile, ...seedSettings,
         publicationFormat: 'paged_comic', layoutMode, pageLayouts: layoutMode === 'manual' ? resolvedPageLayouts() : {}, imageFit,
       })
       const fresh = `${API_BASE}${data.url}?v=${Date.now()}`
@@ -267,8 +270,9 @@ export default function App() {
         <h2 className="font-semibold">ComfyUI renderer</h2>
         {profileError && <p className="rounded bg-amber-50 p-3 text-sm text-amber-800">{profileError}</p>}
         <label className="block text-sm">Workflow profile<select value={profile} onChange={event => setProfile(event.target.value)} className="mt-1 w-full rounded border p-2"><option value="">Select profile</option>{profiles.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-        {profiles.find(item => item.id === profile)?.description && <p className="text-xs text-gray-500">{profiles.find(item => item.id === profile)?.description}</p>}
-        <div className="grid grid-cols-2 gap-3 text-sm"><label>Steps<input value={steps} onChange={event => setSteps(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="Workflow default" /></label><label>Guidance<input value={guidance} onChange={event => setGuidance(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="Workflow default" /></label><label>Seed<input value={seed} onChange={event => setSeed(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="Workflow default" /></label><label>Negative prompt<input value={negativePrompt} onChange={event => setNegativePrompt(event.target.value)} className="mt-1 w-full rounded border p-2" placeholder="If profile maps it" /></label></div>
+        {selectedProfile?.description && <p className="text-xs text-gray-500">{selectedProfile.description}</p>}
+        {selectedProfile?.workflowControls && <div className="grid grid-cols-2 gap-3 text-sm"><p>Steps: {selectedProfile.workflowControls.steps ?? 'workflow setting'} <span className="text-gray-500">(workflow-controlled)</span></p><p>CFG: {typeof selectedProfile.workflowControls.guidance === 'number' ? selectedProfile.workflowControls.guidance.toFixed(1) : 'workflow setting'} <span className="text-gray-500">(workflow-controlled)</span></p></div>}
+        <div className="grid grid-cols-2 gap-3 text-sm"><label>Seed policy<select value={seedPolicy} onChange={event => setSeedPolicy(event.target.value as 'random' | 'fixed')} className="mt-1 w-full rounded border p-2"><option value="random">Random (new variation)</option><option value="fixed">Fixed (reproduce)</option></select></label>{seedPolicy === 'fixed' && <label>Fixed seed<input value={fixedSeed} onChange={event => setFixedSeed(event.target.value)} inputMode="numeric" className="mt-1 w-full rounded border p-2" placeholder="0–18446744073709551615" /></label>}</div>
         <button disabled={loading || !draft.trim() || !profile} onClick={() => void render()} className="rounded bg-indigo-700 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"><ImageIcon className="mr-2 inline h-4 w-4" />Render approved storyboard</button>
         <h2 className="pt-4 font-semibold">History</h2><div className="flex gap-2 overflow-x-auto">{history.map(url => <button key={url} onClick={() => { setPages([url]); void loadMeta(new URL(url).pathname) }} className="h-20 w-14 shrink-0 overflow-hidden rounded border"><img className="h-full w-full object-cover" src={url} /></button>)}</div>
         <div className="space-y-3 rounded border bg-gray-50 p-3 text-sm">

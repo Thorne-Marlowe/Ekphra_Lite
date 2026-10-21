@@ -1,17 +1,23 @@
 {
   "profiles": {
     "flux2-klein-base-9b": {
-      "label": "FLUX.2 Klein Base 9B",
-      "description": "Bind this profile to the exported API workflow that loads Klein Base 9B.",
-      "workflow_path": "workflows/flux2-klein-base-9b_api.json",
+      "label": "FLUX.2 Klein 9B",
+      "description": "Tested FLUX.2 Klein 9B API workflow. The selected ComfyUI model file determines its exact variant.",
+      "available": true,
+      "workflow_controls": { "steps": 4, "guidance": 1.0, "seed": true, "negative_prompt": false },
+      "workflow_path": "workflows/flux2-klein-9b_api.json",
       "input_map": {
-        "positive_prompt": { "node_id": "REPLACE_WITH_NODE_ID", "input_name": "text" }
+        "positive_prompt": { "node_id": "148", "input_name": "text" },
+        "width": { "node_id": "150", "input_name": "value" },
+        "height": { "node_id": "151", "input_name": "value" },
+        "seed": { "node_id": "114", "input_name": "noise_seed" }
       },
-      "output_node_id": "REPLACE_WITH_SAVE_IMAGE_NODE_ID"
+      "output_node_id": "9"
     },
     "krea-2": {
       "label": "Krea 2",
-      "description": "Bind this profile to the exported API workflow that loads Krea 2.",
+      "description": "Add the API-format Krea workflow and replace each placeholder binding with its actual ComfyUI node ID and input name.",
+      "available": false,
       "workflow_path": "workflows/krea-2_api.json",
       "input_map": {
         "positive_prompt": { "node_id": "REPLACE_WITH_NODE_ID", "input_name": "text" }

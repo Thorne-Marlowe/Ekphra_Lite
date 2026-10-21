@@ -4,6 +4,7 @@ import { StoryboardRequestController } from '../src/storyboardRequest.ts'
 import { jobIdFromCompletedPageUrl, VisionQaRequestTracker } from '../src/visionQa.ts'
 import { buildCreativeIntent, buildStoryboardRequest, effectiveCreativeIntentEntries } from '../src/creativeIntent.ts'
 import { buildArtDirection, resolvedArtDirection } from '../src/artDirection.ts'
+import { buildSeedSettings } from '../src/renderSettings.ts'
 
 test('creative controls default to an omitted intent and preserve explicit selections', () => {
   assert.equal(buildCreativeIntent({ genre: '', tone: '', narrativeResolution: 'auto' }), undefined)
@@ -32,6 +33,13 @@ test('art direction is omitted by default and serializes only selected values', 
   })
   assert.equal(resolvedArtDirection({ resolved_prompt: 'approved visual treatment' }), 'approved visual treatment')
   assert.equal(resolvedArtDirection(undefined), null)
+})
+
+test('render seed settings preserve uint64 fixed values and omit a random seed', () => {
+  assert.deepEqual(buildSeedSettings('random', '299955909870984'), { seedMode: 'random' })
+  assert.deepEqual(buildSeedSettings('fixed', '299955909870984'), { seedMode: 'fixed', seed: '299955909870984' })
+  assert.throws(() => buildSeedSettings('fixed', 'not-a-seed'), /Fixed seed/)
+  assert.throws(() => buildSeedSettings('fixed', '18446744073709551616'), /Fixed seed/)
 })
 
 test('effective creative intent display tolerates missing and partial storyboard metadata', () => {

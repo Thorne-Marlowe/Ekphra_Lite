@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from comfyui.client import ComfyUIClient, ComfyUIError
 from comfyui.profiles import ProfileError, RendererProfileStore
 from config import CONFIG
-from panel_engine.comfy_renderer import render_comic_schema
+from panel_engine.comfy_renderer import MAX_RANDOM_NOISE_SEED, render_comic_schema
 from panel_engine.job_status import completed_job_pages, load_manifest
 from page.layouts import compatible_layout_names
 from studio_graph.graph import create_storyboard_graph
@@ -75,7 +75,8 @@ class RenderRequest(BaseModel):
     steps: int | None = Field(default=None, ge=1, le=500)
     guidance: float | None = Field(default=None, ge=0, le=100)
     negativePrompt: str = ""
-    seed: int | None = Field(default=None, ge=0)
+    seed: int | None = Field(default=None, ge=0, le=MAX_RANDOM_NOISE_SEED)
+    seedMode: Literal["random", "fixed"] | None = None
     jobId: str | None = Field(default=None, max_length=100)
     publicationFormat: Literal["paged_comic"] = "paged_comic"
     layoutMode: Literal["auto", "simple", "manual"] = "auto"
@@ -110,13 +111,26 @@ def comfy_client() -> ComfyUIClient:
 
 def profile_or_422(profile_id: str):
     try:
-        return profile_store().get(profile_id)
+        profile = profile_store().get(profile_id)
+        if not profile.available:
+            raise ProfileError(f"Renderer profile '{profile.id}' is not available until its workflow is configured.")
+        return profile
     except ProfileError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def rendering_settings(req: RenderRequest) -> dict:
-    return {"steps": req.steps, "guidance": req.guidance, "negative_prompt": req.negativePrompt, "seed": req.seed}
+    # Legacy callers that supplied a seed before seedMode existed retain the
+    # expected fixed-seed interpretation; omitted seeds now mean random.
+    seed_mode = req.seedMode or ("fixed" if req.seed is not None else "random")
+    if seed_mode == "fixed" and req.seed is None:
+        raise HTTPException(status_code=422, detail="A fixed seed policy requires a seed value.")
+    if seed_mode == "random" and req.seed is not None:
+        raise HTTPException(status_code=422, detail="Random seed policy must not include a fixed seed value.")
+    return {
+        "steps": req.steps, "guidance": req.guidance, "negative_prompt": req.negativePrompt,
+        "seed": req.seed, "seed_mode": seed_mode,
+    }
 
 
 def page_job_info(page_url: str) -> tuple[Path, str, int]:
@@ -247,7 +261,11 @@ async def get_capabilities():
         profiles = profile_store().load()
         return {
             "renderer": "comfyui",
-            "profiles": [{"id": item.id, "label": item.label, "description": item.description} for item in profiles.values()],
+            "profiles": [
+                {"id": item.id, "label": item.label, "description": item.description,
+                 "workflowControls": item.workflow_controls}
+                for item in profiles.values() if item.available
+            ],
             "visionQaEnabled": CONFIG.vision.enabled,
             "publicationFormats": ["paged_comic"],
             "layouts": {str(count): compatible_layout_names(count) for count in range(1, 7)},
@@ -342,10 +360,11 @@ async def render_storyboard(req: RenderRequest):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid storyboard JSON: {exc}") from exc
     profile = profile_or_422(req.rendererProfile)
+    settings = rendering_settings(req)
     job_id = req.jobId or uuid.uuid4().hex
     try:
         pages, _ = render_comic_schema(
-            req.storyboard, job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout,
+            req.storyboard, job_id, profile, comfy_client(), settings, req.layoutStyle, req.mangaLayout,
             publication_format=req.publicationFormat, layout_mode=req.layoutMode,
             page_layouts=req.pageLayouts, image_fit=req.imageFit,
         )
@@ -444,6 +463,7 @@ async def regenerate_panel(req: RegeneratePanelRequest):
     if not found:
         raise HTTPException(status_code=404, detail="Panel not found")
     profile = profile_or_422(req.rendererProfile)
+    settings = rendering_settings(req)
     layout_mode = req.layoutMode
     page_layouts = req.pageLayouts
     image_fit = req.imageFit
@@ -472,7 +492,7 @@ async def regenerate_panel(req: RegeneratePanelRequest):
         # An empty target set means compositor-only dialogue editing.
         targets = [] if req.mode == "dialogue" else [req.panelId]
         pages, _ = render_comic_schema(
-            updated_schema, staging_job_id, profile, comfy_client(), rendering_settings(req), req.layoutStyle, req.mangaLayout, targets,
+            updated_schema, staging_job_id, profile, comfy_client(), settings, req.layoutStyle, req.mangaLayout, targets,
             publication_format=req.publicationFormat, layout_mode=layout_mode,
             page_layouts=page_layouts, image_fit=image_fit, compose_page_numbers=[affected_page_number],
         )
@@ -501,6 +521,19 @@ async def regenerate_panel(req: RegeneratePanelRequest):
             destination = job_dir / "panels" / source.name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+            # Seeds are rendering provenance, not creative storyboard data.
+            # Merge only the regenerated panel's staged seed into the approved
+            # job so unrelated panels keep their original reproducibility data.
+            staged_seeds_path = staging_dir / "panel_seeds.json"
+            if staged_seeds_path.exists():
+                staged_seeds = json.loads(staged_seeds_path.read_text(encoding="utf-8"))
+                if isinstance(staged_seeds, dict) and req.panelId in staged_seeds:
+                    seeds_path = job_dir / "panel_seeds.json"
+                    existing_seeds = json.loads(seeds_path.read_text(encoding="utf-8")) if seeds_path.exists() else {}
+                    if not isinstance(existing_seeds, dict):
+                        existing_seeds = {}
+                    existing_seeds[req.panelId] = staged_seeds[req.panelId]
+                    seeds_path.write_text(json.dumps(existing_seeds, indent=2), encoding="utf-8")
         shutil.copy2(staged_story_path, schema_path)
 
         affected_ids = {

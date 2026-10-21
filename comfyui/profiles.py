@@ -38,6 +38,8 @@ class RendererProfile:
     input_map: dict[str, WorkflowInput] = field(default_factory=dict)
     output_node_id: str | None = None
     description: str = ""
+    available: bool = True
+    workflow_controls: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, profile_id: str, value: dict[str, Any]) -> "RendererProfile":
@@ -51,9 +53,15 @@ class RendererProfile:
             input_map={key: WorkflowInput.from_dict(item) for key, item in raw_map.items()},
             output_node_id=str(value["output_node_id"]).strip() if value.get("output_node_id") else None,
             description=str(value.get("description", "")),
+            available=bool(value.get("available", True)),
+            workflow_controls=dict(value.get("workflow_controls", {})) if isinstance(value.get("workflow_controls", {}), dict) else {},
         )
 
     def load_workflow(self, root: Path) -> dict[str, Any]:
+        if not self.available:
+            raise ProfileError(
+                f"Renderer profile '{self.id}' is not available until its workflow is configured."
+            )
         if not self.workflow_path:
             raise ProfileError(
                 f"Renderer profile '{self.id}' has no workflow_path. Export its ComfyUI API workflow first."
